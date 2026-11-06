@@ -1,5 +1,10 @@
 # MOONDROP Pudding 蓝牙协议逆向分析
 
+> 注：本文是早期逆向记录，部分 Feature 命名已被后续 APK/真机取证修正：
+> `0x2C` 实为手势 TOUCHV2（不是电池）、`0x1A` 为电池、`0x1C` 为提示音、
+> `0x26` 为指示灯、`0x28` 为一拖二、`0x20 cmd 0x05` 为 LHDC。
+> 协议以实现与 README 为准，早期结论保留作过程记录。
+
 > 基于 btsnoop HCI 抓包（5 次）+ DEX 反编译分析 + 杰理 SDK 文档 + 实测验证
 >
 > 设备: MOONDROP Pudding (MD-TWS-056)，杰理芯片 (Jieli VID=0x05D6, PID=0x000A)
