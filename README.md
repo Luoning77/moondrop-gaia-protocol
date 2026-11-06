@@ -32,8 +32,6 @@ FF 04 [Len:2 BE] [00] [Vendor:1D] [Feature:1] [Cmd:1] [Payload...]
 | 通知 | `feature` | `cmd + 0x80` | 异步推送，如 ANC/电量变化 |
 | 错误 | `feature + 1` | `cmd + 0x80` | payload[0] 为错误码 |
 
-> 大量 SET 命令不回 ACK，写入后应延迟 100–300 ms 重读确认。
-
 ### Feature ID
 
 | Feature | 响应 | 用途 | 状态 |
@@ -48,8 +46,6 @@ FF 04 [Len:2 BE] [00] [Vendor:1D] [Feature:1] [Cmd:1] [Payload...]
 | 0x28 | 0x29 | 一拖二（状态/超时/设备列表） | ✓ APK 确认 |
 | 0x2C | 0x2D | 手势 TOUCHV2（5 字节 × 左右耳半字节） | ✓ APK + 真机确认 |
 | 0x40 | 0x41 | ANC V2 降噪控制 | ✓ 实测验证 |
-
-> 注意：帧里的 Feature 字节 = `feature_id << 1`。例如手势 feature 22 → 字节 `0x2C`；电量 feature 13 → `0x1A`。旧文档曾把 `0x2C` 误标成电池，实际是手势。
 
 ## 支持的功能
 
@@ -196,9 +192,6 @@ src/main/kotlin/com/moondrop/protocol/
     └── EqBand.kt          # EQ 频段配置
 ```
 
-> 说明：Kotlin 库里的 `CMD_LDAC_STATUS`、`FEATURE_BATTERY` 等命名沿用早期逆向结果
-> （`0x20` cmd `0x05` 实为 LHDC，`0x2C` 实为手势）；本次 Web 面板按协议总表实现，Kotlin 侧待后续同步。
-
 ## 快速开始
 
 ```kotlin
@@ -293,8 +286,6 @@ API（本地）概览：
 | `GET /api/set/multipoint?on=0/1` | 一拖二开关，写后重读 |
 | `GET /api/send?feature=&cmd=&payload=` | 自定义命令 |
 | `GET /api/presets` | 快捷读取预设 |
-
-> SPP 同一时间只允许一条连接：手机官方 App 连着时 PC 连不上，反之亦然。
 
 ## 辅助工具
 
