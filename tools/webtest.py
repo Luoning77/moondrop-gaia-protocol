@@ -1344,7 +1344,7 @@ dialog::backdrop{background:rgba(0,0,0,.62);backdrop-filter:blur(2px)}
   <div class="ph"><span>指示灯</span><span class="pv" id="ledVal">—</span></div>
   <div class="pb">
     <div class="row">
-      <div class="row-main"><div class="rl">充电盒指示灯</div><div class="rs">26 01 读 / 26 02 写</div></div>
+      <div class="row-main"><div class="rl">耳机指示灯</div><div class="rs">26 01 读 / 26 02 写</div></div>
       <button class="tg ctl" id="ledSw" role="switch" aria-checked="false" aria-label="指示灯开关"></button>
     </div>
     <div class="note">开关状态以 26 01 重读为准</div>
