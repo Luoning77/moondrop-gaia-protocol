@@ -105,23 +105,30 @@ def _summarize(d):
         return ""
 
     if base_feature == 0x00:
-        if cmd == 0x05:
-            return f"固件版本: {d.get('ascii') or '(空)'}"
-        if cmd == 0x14:
-            return f"序列号: {d.get('ascii') or '(空)'}"
-        if cmd == 0x15:
-            return f"设备 ID: {d.get('ascii') or '(空)'}"
-        if cmd == 0x0D:
-            return f"设备状态: {_hex_bytes(payload)}"
-        if cmd == 0x0C:
-            cid = f"0x{payload[0]:02X}" if payload else "?"
-            rest = _hex_bytes(payload[1:]) if len(payload) > 1 else "(空)"
-            return f"配置查询 {cid}: {rest}"
-        if cmd == 0x07:
-            return f"EQ 状态: {_hex_bytes(payload) or '(空)'}"
+        if cmd == 0x00:
+            return f"GAIA 版本: {_hex_bytes(payload) or '(空)'}"
         if cmd == 0x01:
-            return f"支持的命令/特性: {len(payload)} 字节"
-        return f"基础查询 C:0x{cmd:02X}"
+            return f"支持的特性: {max(0, (len(payload) - 1) // 2)} 项"
+        if cmd == 0x02:
+            return f"支持的特性(下一页): {max(0, (len(payload) - 1) // 2)} 项"
+        if cmd == 0x03:
+            return f"设备序列号: {d.get('ascii') or '(空)'}"
+        if cmd == 0x05:
+            return f"应用/固件版本: {d.get('ascii') or '(空)'}"
+        if cmd == 0x07:
+            return f"注册通知: {_hex_bytes(payload) or '(空)'}"
+        if cmd == 0x08:
+            return f"取消通知: {_hex_bytes(payload) or '(空)'}"
+        if cmd == 0x0C:
+            pid = f"0x{payload[0]:02X}" if payload else "?"
+            return f"传输信息 {pid}: {_hex_bytes(payload[1:]) or '(空)'}"
+        if cmd == 0x0D:
+            return f"传输参数: {_hex_bytes(payload) or '(空)'}"
+        if cmd == 0x14:
+            return f"左耳序列号: {d.get('ascii') or '(空)'}"
+        if cmd == 0x15:
+            return f"右耳序列号: {d.get('ascii') or '(空)'}"
+        return f"基础 C:0x{cmd:02X}"
 
     if base_feature == 0x40:
         if cmd in (0x03, 0x04) and payload:
@@ -286,13 +293,16 @@ class MockSerial:
         self._onebringtwo = 0
         self._onebringtwo_timeout = 5
         self._fw = b"3.5.2-demo"
-        self._serial = b"DEMO-SN-0001"
-        self._device_id = b"DEMO-DEVICE"
+        self._serial = b"DEMO-DEVICE-SN"     # 0x00 cmd 0x03
+        self._serial_l = b"DEMO-SN-L-0001"   # 0x00 cmd 0x14
+        self._serial_r = b"DEMO-SN-R-0001"   # 0x00 cmd 0x15
         self._peer = b"\x52\x3E\x85\x63\x9C\xB0"
+        self._notify_features = set()
 
     # ---- pyserial 兼容接口 ----
     def reset_input_buffer(self):
         self._rx.clear()
+        self._pending.clear()
 
     def flush(self):
         pass
@@ -308,10 +318,12 @@ class MockSerial:
 
     def close(self):
         self.is_open = False
+        self._pending.clear()
 
     def write(self, data):
+        raw = bytes(data)
         # 拼接上次遗留的半帧，支持一个帧被拆成多次写入。
-        data = bytes(self._pending) + bytes(data)
+        data = bytes(self._pending) + raw
         self._pending = bytearray()
         replies = bytearray()
         try:
@@ -331,7 +343,7 @@ class MockSerial:
         if self.latency:
             time.sleep(self.latency)
         self._rx += replies
-        return len(data)
+        return len(raw)
 
     # ---- 帧构造 ----
     @staticmethod
@@ -486,24 +498,40 @@ class MockSerial:
                 return self._ack(f, c, b"")
             return self._error(f, c, 1)
 
-        if f == 0x00:                     # 基础查询
-            if c == 0x05:
-                return self._reply(f, c, self._fw)
-            if c == 0x14:
-                return self._reply(f, c, self._serial)
-            if c == 0x15:
-                return self._reply(f, c, self._device_id)
-            if c == 0x0D:
-                return self._reply(f, c, bytes([0x07, 0x00, 0x00, 0x00, 0x04]))
-            if c == 0x0C:
-                return self._reply(f, c, bytes([pl[0] if pl else 0, 0x00, 0x00, 0x00, 0x80]))
-            if c == 0x07:
-                return self._reply(f, c, bytes([0x01]))
+        if f == 0x00:                     # 基础域（APK: V3BasicPlugin）
+            if c == 0x00:
+                return self._reply(f, c, bytes([0x03]))      # GAIA 版本
             if c == 0x01:
-                # 8 字节位图: feature 0,5,13,14,15,16,19,20,22,32
-                return self._reply(f, c, bytes([0x21, 0xE0, 0x59, 0x00, 0x01, 0x00, 0x00, 0x00]))
+                # [more][featureId][version]... 成对列表
+                return self._reply(f, c, bytes([
+                    0x00,
+                    0x00, 0x01, 0x05, 0x01, 0x0D, 0x01, 0x0E, 0x01, 0x0F, 0x01,
+                    0x10, 0x01, 0x13, 0x01, 0x14, 0x01, 0x16, 0x01, 0x20, 0x01,
+                ]))
             if c == 0x02:
-                return self._reply(f, c, b"")
+                return self._reply(f, c, b"")                # 下一页特性
+            if c == 0x03:
+                return self._reply(f, c, self._serial)       # 设备序列号
+            if c == 0x05:
+                return self._reply(f, c, self._fw)           # 应用/固件版本
+            if c == 0x07:
+                if pl:
+                    self._notify_features.add(pl[0])
+                return self._ack(f, c, b"")                  # 注册通知
+            if c == 0x08:
+                if pl:
+                    self._notify_features.discard(pl[0])
+                return self._ack(f, c, b"")                  # 取消通知
+            if c == 0x0C:
+                if len(pl) != 1 or not 1 <= pl[0] <= 7:
+                    return self._error(f, c, 5)
+                return self._reply(f, c, bytes([pl[0], 0x00]))  # 读取传输信息（占位）
+            if c == 0x0D:
+                return self._ack(f, c, bytes(pl))            # 设置传输参数（写）
+            if c == 0x14:
+                return self._reply(f, c, self._serial_l)     # 左耳序列号
+            if c == 0x15:
+                return self._reply(f, c, self._serial_r)     # 右耳序列号
             return self._reply(f, c, b"")
 
         if f == 0x0A:                     # EQ（面板未使用，保持可查询）
@@ -548,12 +576,35 @@ def _error_result(tx, message):
     }
 
 
+_rx_carry = bytearray()
+
+
+def _take_frame(buf):
+    """从缓冲区头部取一个 FF 04 帧；返回 (frame, rest) 或 (None, buf)。"""
+    if len(buf) < 8 or not buf.startswith(b"\xFF\x04"):
+        return None, buf
+    body_len = (buf[2] << 8) | buf[3]
+    total = 8 + body_len
+    if len(buf) < total:
+        return None, buf
+    return bytes(buf[:total]), buf[total:]
+
+
 def _recv_frame(timeout):
-    """读取一个完整帧。优先按 FF 04 长度字段判断，裸 PDU 按 50ms 静默判断。"""
+    """读取一个完整帧。优先按 FF 04 长度字段判断，裸 PDU 按 50ms 静默判断。
+
+    一次 read 可能带回多帧：只返回第一帧，剩余字节留在 _rx_carry，
+    供 send_cmd 继续匹配，避免把同一批到达的真实响应丢掉。
+    """
     if not ser or not ser.is_open:
         return b""
     deadline = time.time() + max(0.05, timeout)
-    buf = bytearray()
+    buf = bytearray(_rx_carry)
+    _rx_carry.clear()
+    frame, rest = _take_frame(buf)
+    if frame is not None:
+        _rx_carry.extend(rest)
+        return frame
     last_rx = 0.0
     while time.time() < deadline:
         try:
@@ -577,11 +628,11 @@ def _recv_frame(timeout):
                         buf = buf[-1:]
                     else:
                         buf.clear()
-                if buf.startswith(b"\xFF\x04") and len(buf) >= 4:
-                    body_len = (buf[2] << 8) | buf[3]
-                    total = 8 + body_len
-                    if len(buf) >= total:
-                        return bytes(buf[:total])
+                if buf.startswith(b"\xFF\x04"):
+                    frame, rest = _take_frame(buf)
+                    if frame is not None:
+                        _rx_carry.extend(rest)
+                        return frame
                 elif buf.startswith(b"\x00\x1D") and len(buf) >= 4:
                     if time.time() - last_rx >= 0.05:
                         return bytes(buf)
@@ -589,7 +640,9 @@ def _recv_frame(timeout):
             if buf.startswith(b"\x00\x1D") and len(buf) >= 4 and time.time() - last_rx >= 0.05:
                 return bytes(buf)
             time.sleep(0.005)
-    return bytes(buf) if buf else b""
+    if buf:
+        _rx_carry.extend(buf)
+    return b""
 
 
 def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
@@ -598,18 +651,41 @@ def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
     if ser is None or not ser.is_open:
         return _error_result(tx, "串口未连接")
 
+    expected_feature = (feature | 0x01) & 0xFF
+    expected_cmd = cmd & 0x7F
     last_rx = b""
+    last_decoded = None
+    matched = False
     for attempt in range(retries + 1):
         with ser_lock:
             if ser is None or not ser.is_open:
                 return _error_result(tx, "串口未连接")
             try:
                 ser.reset_input_buffer()
+                _rx_carry.clear()
                 ser.write(tx)
                 ser.flush()
             except Exception as exc:
                 return _error_result(tx, f"串口写入失败: {exc}")
-            last_rx = _recv_frame(timeout)
+            deadline = time.time() + max(0.05, timeout)
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                frame = _recv_frame(remaining)
+                if not frame:
+                    break
+                last_rx = frame
+                last_decoded = decode_packet(frame)
+                if (last_decoded
+                        and last_decoded["feature"] == expected_feature
+                        and last_decoded["cmd_base"] == expected_cmd
+                        and last_decoded["frame_type"] in ("response", "error")):
+                    matched = True
+                    break
+                # 通知或其他命令的响应：继续等到 deadline，找真正的响应。
+        if matched:
+            break
         if last_rx:
             break
         if attempt < retries:
@@ -617,21 +693,25 @@ def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
 
     if not last_rx:
         return _error_result(tx, "无响应")
-    decoded = decode_packet(last_rx)
     result = {
         "tx": decode_packet(tx),
         "tx_raw": tx.hex(" ").upper(),
         "rx_raw": last_rx.hex(" ").upper(),
-        "decoded": decoded,
+        "decoded": last_decoded,
+        "matched": matched,
     }
-    if decoded is None:
+    if last_decoded is None:
         result["warning"] = "收到无法解析的帧"
+    elif not matched:
+        result["warning"] = "未收到匹配的响应帧"
     return result
 
 
 def _payload_of(result):
     d = result.get("decoded") if result else None
     if not d or d.get("frame_type") in ("error", "notification"):
+        return None
+    if result.get("matched") is False:
         return None
     return d.get("payload")
 
@@ -677,6 +757,7 @@ def _set_verify(action, set_spec, read_spec, expected, label_set, label_read, ex
     set_result["no_reply_ok"] = True
     steps.append(set_result)
     set_error = _error_of(set_result)
+    set_failure = set_result.get("error")
 
     time.sleep(0.2)
     read_result = send_cmd(read_spec[0], read_spec[1], "", timeout=1.0, retries=1)
@@ -688,8 +769,12 @@ def _set_verify(action, set_spec, read_spec, expected, label_set, label_read, ex
     ok = after == expected
     if ok:
         message = "写入后重读一致"
+    elif set_failure and set_failure != "无响应":
+        message = f"写入失败：{set_failure}"
     elif set_error:
         message = f"设备拒绝：{set_error}"
+    elif after is None and read_result.get("error"):
+        message = f"重读失败：{read_result['error']}"
     elif after is None:
         message = "写入已发送，但重读无响应"
     else:
@@ -1001,10 +1086,12 @@ def set_tone(enabled=None, volume=None, index=None):
 
 
 PRESETS = [
-    {"name": "固件版本", "feature": 0x00, "cmd": 0x05, "payload": ""},
-    {"name": "序列号", "feature": 0x00, "cmd": 0x14, "payload": ""},
-    {"name": "设备ID", "feature": 0x00, "cmd": 0x15, "payload": ""},
-    {"name": "设备状态", "feature": 0x00, "cmd": 0x0D, "payload": "0700000004"},
+    {"name": "应用/固件版本", "feature": 0x00, "cmd": 0x05, "payload": ""},
+    {"name": "支持的特性", "feature": 0x00, "cmd": 0x01, "payload": ""},
+    {"name": "设备序列号", "feature": 0x00, "cmd": 0x03, "payload": ""},
+    {"name": "左耳序列号", "feature": 0x00, "cmd": 0x14, "payload": ""},
+    {"name": "右耳序列号", "feature": 0x00, "cmd": 0x15, "payload": ""},
+    {"name": "传输信息", "feature": 0x00, "cmd": 0x0C, "payload": "02"},
     {"name": "ANC 状态", "feature": 0x40, "cmd": 0x03, "payload": ""},
     {"name": "ANC 切换配置", "feature": 0x40, "cmd": 0x29, "payload": ""},
     {"name": "手势当前", "feature": 0x2C, "cmd": 0x02, "payload": ""},
@@ -1375,6 +1462,7 @@ const S = {
   lhdc:null, lc3:null, ldac:null, obt:null, obtTimeout:null
 };
 let busy = false;
+let busyCount = 0;
 let logTotal = 0;
 let pendingTouch = null;
 let toastTimer = null;
@@ -1410,7 +1498,15 @@ function setStatus(text, cls){
 function syncControls(){
   const locked = busy || !S.online;
   document.querySelectorAll('.ctl').forEach(function(el){ el.disabled = locked; });
+  document.querySelectorAll('#fi,#ci,#pi').forEach(function(el){ el.disabled = locked; });
   $('refreshBtn').disabled = busy;
+  const toneKnown = !!(S.tone && S.tone.length >= 3);
+  ['toneSw','toneVol','toneIndex','toneApply'].forEach(function(id){
+    const el = $(id);
+    if(el) el.disabled = locked || !toneKnown;
+  });
+  const dlgConfirm = $('dlgConfirm');
+  if(dlgConfirm) dlgConfirm.disabled = busy;
   if(!locked){
     const haveTouch = !!(S.touch && S.touch.length === 5);
     $('touchApply').disabled = !haveTouch;
@@ -1421,8 +1517,9 @@ function syncControls(){
 }
 
 function setBusy(value){
-  busy = value;
-  if(value){
+  busyCount = Math.max(0, busyCount + (value ? 1 : -1));
+  busy = busyCount > 0;
+  if(busy){
     setStatus('通信中…','wait');
   }else if(S.online){
     setStatus(S.demo ? '已连接 · DEMO' : '已连接','ok');
@@ -1506,7 +1603,7 @@ function syncTonePending(){
 }
 
 function absorb(decoded){
-  if(!decoded || decoded.frame_type === 'error' || decoded.frame_type === 'command') return;
+  if(!decoded || decoded.frame_type !== 'response') return;
   const f = decoded.feature_base;
   const c = decoded.cmd_base;
   const p = decoded.payload || [];
@@ -1542,7 +1639,9 @@ function absorb(decoded){
 }
 
 function absorbSteps(steps){
-  (steps || []).forEach(function(step){ if(step) absorb(step.decoded); });
+  (steps || []).forEach(function(step){
+    if(step && step.matched !== false) absorb(step.decoded);
+  });
 }
 
 function applyState(st){
@@ -1757,7 +1856,12 @@ async function refreshAll(){
 
 async function refreshBattery(silent){
   try{
-    await apiCall('/api/send?feature=26&cmd=1&payload=010203', '读取电量');
+    const data = await apiCall('/api/send?feature=26&cmd=1&payload=010203', '读取电量');
+    const step = data.steps && data.steps[0];
+    if(!step || step.error || !step.decoded){
+      if(!silent) toast((step && step.error) || '电量读取失败', false);
+      return;
+    }
     renderAll();
     if(!silent) toast('电量已刷新', true);
   }catch(err){
@@ -1812,11 +1916,13 @@ function touchChanged(){
 }
 
 async function reloadTouch(){
+  if(busy) return;
   try{
     const data = await apiCall('/api/send?feature=44&cmd=2', '读取当前手势');
     const step = data.steps && data.steps[0];
-    const payload = step && step.decoded && step.decoded.payload;
-    if(payload && payload.length >= 5){
+    const d = step && step.decoded;
+    const payload = d && d.payload;
+    if(d && d.frame_type === 'response' && payload && payload.length >= 5){
       S.touch = payload.slice(0,5);
       S.touchDirty = false;
       S.touchPending = null;
@@ -1825,15 +1931,17 @@ async function reloadTouch(){
     }else{
       throw new Error('没有拿到 5 字节手势配置');
     }
-  }catch(err){}
+  }catch(err){ toast(err.message || '读取手势失败', false); }
 }
 
 async function loadTouchDefaults(){
+  if(busy) return;
   try{
     const data = await apiCall('/api/send?feature=44&cmd=1', '读取手势出厂默认');
     const step = data.steps && data.steps[0];
-    const payload = step && step.decoded && step.decoded.payload;
-    if(payload && payload.length >= 5){
+    const d = step && step.decoded;
+    const payload = d && d.payload;
+    if(d && d.frame_type === 'response' && payload && payload.length >= 5){
       S.touchDefault = payload.slice(0,5);
       S.touchPending = payload.slice(0,5);
       S.touchDirty = true;
@@ -1842,7 +1950,7 @@ async function loadTouchDefaults(){
     }else{
       throw new Error('没有拿到出厂默认手势');
     }
-  }catch(err){}
+  }catch(err){ toast(err.message || '读取出厂默认失败', false); }
 }
 
 function openTouchDialog(){
@@ -1863,6 +1971,8 @@ function openTouchDialog(){
 }
 
 async function writeTouch(values){
+  if(busy){ toast('通信中，请稍候', false); return; }
+  if(!S.online){ toast('设备未连接', false); return; }
   try{
     const data = await apiCall('/api/set/touch?hex=' + values.map(hex2).join(''), '写入手势');
     if(Array.isArray(data.after) && data.after.length === 5) S.touch = data.after.slice(0,5);
@@ -1883,6 +1993,11 @@ async function writeTouch(values){
 }
 
 async function applyTone(){
+  if(!(S.tone && S.tone.length >= 3)){
+    toast('尚未读取到提示音配置，请先刷新', false);
+    return;
+  }
+  if(busy){ toast('通信中，请稍候', false); return; }
   if(!S.tonePending) syncTonePending();
   const pending = S.tonePending;
   const query = 'enabled=' + (pending.enabled ? 1 : 0) + '&volume=' + Math.round(pending.volume) + '&index=' + Math.round(pending.index);
@@ -1904,6 +2019,8 @@ async function applyTone(){
 }
 
 async function sendCustom(){
+  if(busy){ toast('通信中，请稍候', false); return; }
+  if(!S.online){ toast('设备未连接', false); return; }
   const feature = parseInt($('fi').value, 16);
   const cmd = parseInt($('ci').value, 16);
   if(Number.isNaN(feature) || Number.isNaN(cmd)){
@@ -1920,14 +2037,26 @@ async function sendCustom(){
     return;
   }
   try{
-    await apiCall('/api/send?feature=' + feature + '&cmd=' + cmd + '&payload=' + encodeURIComponent(payload), '自定义命令');
+    const data = await apiCall('/api/send?feature=' + feature + '&cmd=' + cmd + '&payload=' + encodeURIComponent(payload), '自定义命令');
+    const step = data.steps && data.steps[0];
+    if(!step || step.error || !step.decoded){
+      toast((step && step.error) || '未收到响应', false);
+      return;
+    }
     toast('命令已发送', true);
   }catch(err){}
 }
 
 async function sendPreset(preset){
+  if(busy){ toast('通信中，请稍候', false); return; }
+  if(!S.online){ toast('设备未连接', false); return; }
   try{
-    await apiCall('/api/send?feature=' + preset.feature + '&cmd=' + preset.cmd + '&payload=' + encodeURIComponent(preset.payload || ''), '快捷: ' + preset.name);
+    const data = await apiCall('/api/send?feature=' + preset.feature + '&cmd=' + preset.cmd + '&payload=' + encodeURIComponent(preset.payload || ''), '快捷: ' + preset.name);
+    const step = data.steps && data.steps[0];
+    if(!step || step.error || !step.decoded){
+      toast((step && step.error) || '未收到响应', false);
+      return;
+    }
     toast(preset.name + ' 已读取', true);
   }catch(err){}
 }
@@ -2086,7 +2215,11 @@ class Handler(BaseHTTPRequestHandler):
             return False
         host = (self.headers.get("Host") or "").strip()
         if not host:
-            return True
+            return False
+        # 只接受本机访问，避免 DNS rebinding 把 Host 伪造成攻击者域名。
+        host_name = host.rsplit(":", 1)[0].lower() if ":" in host else host.lower()
+        if host_name not in ("127.0.0.1", "localhost"):
+            return False
         expected = f"http://{host}"
         origin = self.headers.get("Origin")
         if origin and origin.rstrip("/") != expected:

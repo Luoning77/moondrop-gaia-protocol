@@ -22,6 +22,7 @@ FF 04 [Len:2 BE] [00] [Vendor:1D] [Feature:1] [Cmd:1] [Payload...]
 - Len = payload.size（与 btsnoop 抓包一致）
 - 总包长 = 8 + payload.size
 - 响应 Feature = 请求 Feature | 0x01 (bit0)
+- Feature 字节 = `feature_id << 1`，bit0 为响应位；例如 ANC V2 的 feature_id=32 → `0x40`
 - 多字节字段一律大端，Vendor 为 16 位 `0x001D`
 - 第 4 字节抓包始终为 `0x00`（早期逆向曾记为递增序列号；也可能是 Vendor `0x001D` 的高字节，待确认）
 
@@ -37,7 +38,7 @@ FF 04 [Len:2 BE] [00] [Vendor:1D] [Feature:1] [Cmd:1] [Payload...]
 
 | Feature | 响应 | 用途 | 状态 |
 |---------|------|------|------|
-| 0x00 | 0x01 | 基础查询（固件、序列号、设备 ID、配置、设备状态） | ✓ 已确认 |
+| 0x00 | 0x01 | 基础域（支持特性、序列号、版本、传输信息等） | ✓ APK 复核 |
 | 0x0A | 0x0B | EQ 参数读写（频率/gain/Q） | ✓ 实测验证 |
 | 0x1A | 0x1B | 电池电量 | ✓ 实测验证 |
 | 0x1C | 0x1D | 提示音（开关/音量/组号） | ✓ 协议总表确认 |
@@ -50,17 +51,23 @@ FF 04 [Len:2 BE] [00] [Vendor:1D] [Feature:1] [Cmd:1] [Payload...]
 
 ## 支持的功能
 
-### 基础查询 (Feature=0x00)
+### 基础域 (Feature=0x00)
 
 | Cmd | 功能 | 状态 |
 |-----|------|------|
-| 0x01 | 支持的命令列表 | ✓ |
-| 0x05 | 固件版本 | ✓ |
-| 0x07 | EQ 状态（兼心跳） | ✓ |
-| 0x0C | 配置查询（子命令在 payload 中） | ✓ |
-| 0x0D | 设备状态 | ✓ |
-| 0x14 | 序列号 | ✓ |
-| 0x15 | 设备 ID | ✓ |
+| 0x00 | GAIA 版本 | ✓ |
+| 0x01 | 支持的特性（首字节 more，后接 `[featureId][version]` 成对） | ✓ APK 复核 |
+| 0x02 | 支持的特性（下一页，同样为 more + 成对） | ✓ APK 复核 |
+| 0x03 | 设备序列号 | ✓ APK 复核 |
+| 0x05 | 应用/固件版本（APK 名称 APPLICATION_VERSION） | ✓ |
+| 0x07 | 注册通知（Payload=`[feature id]`） | ✓ APK 复核 |
+| 0x08 | 取消通知（Payload=`[feature id]`） | ✓ APK 复核 |
+| 0x0C | 读取传输信息（Payload=ProtocolInfo id 1..7） | ✓ APK 复核 |
+| 0x0D | 设置传输参数（**写命令**，不要放进快捷读取） | ✓ APK 复核 |
+| 0x14 | 左耳序列号（EARBUD_SN_L） | ✓ APK 复核 |
+| 0x15 | 右耳序列号（EARBUD_SN_R） | ✓ APK 复核 |
+
+> 早期文档把 `0x01` 写成“支持的命令列表”、`0x07` 写成“EQ 状态”、`0x0C` 写成“配置查询”、`0x0D` 写成“设备状态”、`0x14/0x15` 写成“序列号/设备 ID”，均已按官方 APK `V3BasicPlugin` 更正。
 
 ### ANC 降噪控制 (Feature=0x40)
 
@@ -68,7 +75,8 @@ FF 04 [Len:2 BE] [00] [Vendor:1D] [Feature:1] [Cmd:1] [Payload...]
 |-----|------|------|
 | 0x03 | ANC 状态查询 | ✓ |
 | 0x04 | ANC 模式设置 | ✓ |
-| 0x29 | ANC 可用模式查询 | ✓ |
+| 0x29 | ANC 切换配置读取 | ✓ |
+| 0x2A | ANC 切换配置写入 | ✓ |
 | 0x81 | ANC 状态异步推送 | ✓ |
 | 0x84 | ANC 错误通知 | ✓ |
 
@@ -152,13 +160,21 @@ FF 04 [Len:2 BE] [00] [Vendor:1D] [Feature:1] [Cmd:1] [Payload...]
 | 0x06 | 列表翻页 | `FF 04 00 00 00 1D 28 06` |
 | 0x07 | 断开某台 | `... 28 07 <num><addr:6><name:utf8>` |
 
-### EQ 参数 (Feature=0x0A)
+### EQ (Feature=0x0A)
 
-| Cmd | 功能 | 状态 |
+| Cmd | 功能（APK V3MusicProcessingPlugin） | 状态 |
 |-----|------|------|
-| 0x03 | EQ 带宽 | ✓ |
-| 0x05 | EQ 参数查询 | ✓ |
-| 0x06 | EQ 参数设置 | ✓ |
+| 0x00 | EQ 状态 | ✓ APK 复核 |
+| 0x01 | 可用预设 | ✓ APK 复核 |
+| 0x02 | 读取 EQ Set | ✓ APK 复核 |
+| 0x03 | 写入 EQ Set | ✓ APK 复核 |
+| 0x04 | 用户频段数 | ✓ APK 复核 |
+| 0x05 | 读取用户配置 | ✓ APK 复核 |
+| 0x06 | 写入用户配置 | ✓ APK 复核 |
+| 0x07 | 保存用户设置 | ✓ APK 复核 |
+| 0x08 | 写 NV ID | ✓ APK 复核 |
+
+> 早期文档把 `0x03` 写成“EQ 带宽”、`0x05/0x06` 写成“参数查询/设置”，已按 APK 更正；payload 编码仍需真机复核。
 
 ## ANC 模式
 
@@ -208,15 +224,15 @@ val bytes = GaiaCodec.encode(query)
 val set = GaiaPacketBuilder.ancSet(AncMode.ADAPTIVE)
 val bytes2 = GaiaCodec.encode(set)
 
-// 查询 ANC 可用模式
-val avail = GaiaPacketBuilder.ancAvailable()
+// 查询 ANC 切换配置
+val avail = GaiaPacketBuilder.ancConfigQuery()
 val bytes3 = GaiaCodec.encode(avail)
 
 // Gain 设置为低
 val gainSet = GaiaPacketBuilder.gainSet(GainLevel.LOW)
 val bytes4 = GaiaCodec.encode(gainSet)
 
-// 固件版本查询
+// 应用/固件版本查询
 val fwQuery = GaiaPacketBuilder.firmwareVersionQuery()
 val bytes5 = GaiaCodec.encode(fwQuery)
 

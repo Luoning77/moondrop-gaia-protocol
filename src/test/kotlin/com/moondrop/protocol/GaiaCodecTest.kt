@@ -68,12 +68,31 @@ class GaiaCodecTest {
     }
 
     @Test
+    fun `basic domain commands use documented ids`() {
+        fun cmdOf(bytes: ByteArray) = bytes[7].toInt() and 0xFF
+        assertEquals(0x01, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.supportedFeaturesQuery())))
+        assertEquals(0x02, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.supportedFeaturesNextQuery())))
+        assertEquals(0x03, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.deviceSerialNumberQuery())))
+        assertEquals(0x05, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.applicationVersionQuery())))
+        assertEquals(0x0C, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.transportInformationQuery(0x02.toByte()))))
+        assertEquals(0x02, GaiaCodec.encode(GaiaPacketBuilder.transportInformationQuery(0x02.toByte()))[8].toInt() and 0xFF)
+        assertEquals(0x14, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.leftEarbudSerialNumberQuery())))
+        assertEquals(0x15, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.rightEarbudSerialNumberQuery())))
+        assertEquals(0x29, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.ancConfigQuery())))
+    }
+
+    @Test
     fun `feature constants use documented ids`() {
         assertEquals(0x1A, GaiaConstants.FEATURE_BATTERY) // 电池
         assertEquals(0x2C, GaiaConstants.FEATURE_TOUCH)   // 手势 TOUCHV2
-        assertEquals(0x28, GaiaConstants.FEATURE_DEVICE_INFO)
+        assertEquals(0x28, GaiaConstants.FEATURE_ONEBRINGTWO)
+        assertEquals(0x26, GaiaConstants.FEATURE_LED)
+        assertEquals(0x1C, GaiaConstants.FEATURE_VOICE)
         assertEquals(0x00, GaiaConstants.CMD_BATTERY_SUPPORTED)
         assertEquals(0x01, GaiaConstants.CMD_BATTERY_QUERY)
+        assertEquals(0x03, GaiaConstants.CMD_SERIAL_NUMBER)
+        assertEquals(0x14, GaiaConstants.CMD_EARBUD_SN_L)
+        assertEquals(0x15, GaiaConstants.CMD_EARBUD_SN_R)
     }
 
     // ========== 解码 ==========
@@ -179,6 +198,38 @@ class GaiaCodecTest {
     @Test
     fun `parse firmware fails on wrong feature`() {
         assertNull(ResponseParser.parseFirmwareVersion(GaiaPacket(0x07, 0x05, "1.0".toByteArray())))
+    }
+
+    @Test
+    fun `parse basic domain strings`() {
+        assertEquals("DEV-SN", ResponseParser.parseSerialNumber(GaiaPacket(0x01, 0x03, "DEV-SN".toByteArray())))
+        assertEquals("L-SN", ResponseParser.parseLeftEarbudSerialNumber(GaiaPacket(0x01, 0x14, "L-SN".toByteArray())))
+        assertEquals("R-SN", ResponseParser.parseRightEarbudSerialNumber(GaiaPacket(0x01, 0x15, "R-SN".toByteArray())))
+        assertEquals("3.5.2", ResponseParser.parseApplicationVersion(GaiaPacket(0x01, 0x05, "3.5.2".toByteArray())))
+        assertNull(ResponseParser.parseSerialNumber(GaiaPacket(0x01, 0x14, "L-SN".toByteArray())))
+    }
+
+    @Test
+    fun `parse led voice touch and onebringtwo`() {
+        assertEquals(true, ResponseParser.parseLed(GaiaPacket(0x27, 0x01, byteArrayOf(0x01))))
+        assertEquals(listOf(1, 60, 3), ResponseParser.parseVoiceConfig(GaiaPacket(0x1D, 0x01, byteArrayOf(0x01, 60, 3))))
+        assertEquals(listOf(0x11, 0x23, 0x66, 0x77, 0x00),
+            ResponseParser.parseTouchConfig(GaiaPacket(0x2D, 0x02, byteArrayOf(0x11, 0x23, 0x66, 0x77, 0x00))))
+        assertEquals(true, ResponseParser.parseOnebringtwoState(GaiaPacket(0x29, 0x01, byteArrayOf(0x01))))
+        assertEquals(5, ResponseParser.parseOnebringtwoTimeout(GaiaPacket(0x29, 0x03, byteArrayOf(0x05))))
+    }
+
+    @Test
+    fun `encode led voice touch and onebringtwo`() {
+        fun cmdOf(bytes: ByteArray) = bytes[7].toInt() and 0xFF
+        assertEquals(0x26, GaiaCodec.encode(GaiaPacketBuilder.ledSet(true))[6].toInt() and 0xFF)
+        assertEquals(0x02, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.ledSet(true))))
+        assertEquals(0x1C, GaiaCodec.encode(GaiaPacketBuilder.voiceSet(true, 60, 3))[6].toInt() and 0xFF)
+        assertEquals(listOf(0x01, 60, 3),
+            GaiaCodec.encode(GaiaPacketBuilder.voiceSet(true, 60, 3)).drop(8).map { it.toInt() and 0xFF })
+        assertEquals(0x03, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.touchSet(byteArrayOf(1, 2, 3, 4, 5)))))
+        assertEquals(0x02, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.onebringtwoSet(true))))
+        assertEquals(0x04, cmdOf(GaiaCodec.encode(GaiaPacketBuilder.onebringtwoTimeoutSet(5))))
     }
 
     @Test

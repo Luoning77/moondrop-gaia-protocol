@@ -37,36 +37,50 @@ object GaiaConstants {
     const val FEATURE_CODEC: Int = 0x20
     /** EQ 参数读写 */
     const val FEATURE_EQ: Int = 0x0A
-    /** 设备信息（配对设备名、子类型） */
-    const val FEATURE_DEVICE_INFO: Int = 0x28
+    /** 指示灯 */
+    const val FEATURE_LED: Int = 0x26
+    /** 一拖二 (ONEBRINGTWO) */
+    const val FEATURE_ONEBRINGTWO: Int = 0x28
     /** 电池电量（Feature=0x1A，README/实测确认） */
     const val FEATURE_BATTERY: Int = 0x1A
+    /** 提示音（VOICE） */
+    const val FEATURE_VOICE: Int = 0x1C
     /** 手势 TOUCHV2（Feature=0x2C，APK + 真机确认） */
     const val FEATURE_TOUCH: Int = 0x2C
 
-    // ========== Cmd ID - 基础查询 (Feature=0x00, 抓包确认) ==========
-    /** 支持的命令列表 */
-    const val CMD_SUPPORTED_COMMANDS: Int = 0x01
-    /** 固件版本查询 */
-    const val CMD_FIRMWARE_VERSION: Int = 0x05
-    /** EQ 状态查询（兼作心跳） */
-    const val CMD_EQ_STATUS: Int = 0x07
-    /** 设备状态 */
-    const val CMD_DEVICE_STATE: Int = 0x0D
-    /** 配置查询 (子命令在 payload 中) */
-    const val CMD_CONFIG_QUERY: Int = 0x0C
-    /** 序列号查询 */
-    const val CMD_SERIAL: Int = 0x14
-    /** 设备 ID 查询 */
-    const val CMD_DEVICE_ID: Int = 0x15
+    // ========== Cmd ID - 基础域 (Feature=0x00, APK V3BasicPlugin 确认) ==========
+    /** GAIA 版本 */
+    const val CMD_GAIA_VERSION: Int = 0x00
+    /** 支持的特性（首字节 more，后接 `[featureId][version]` 成对） */
+    const val CMD_SUPPORTED_FEATURES: Int = 0x01
+    /** 支持的特性（下一页，同样为成对格式） */
+    const val CMD_SUPPORTED_FEATURES_NEXT: Int = 0x02
+    /** 设备序列号 */
+    const val CMD_SERIAL_NUMBER: Int = 0x03
+    /** 应用/固件版本（APK 名称 APPLICATION_VERSION） */
+    const val CMD_APPLICATION_VERSION: Int = 0x05
+    /** 注册通知：Payload=[feature id] */
+    const val CMD_REGISTER_NOTIFICATION: Int = 0x07
+    /** 取消通知：Payload=[feature id] */
+    const val CMD_CANCEL_NOTIFICATION: Int = 0x08
+    /** 读取传输信息：Payload=[ProtocolInfo id 1..7] */
+    const val CMD_GET_TRANSPORT_INFORMATION: Int = 0x0C
+    /** 设置传输参数（写） */
+    const val CMD_SET_TRANSPORT_PARAMETER: Int = 0x0D
+    /** 左耳序列号 */
+    const val CMD_EARBUD_SN_L: Int = 0x14
+    /** 右耳序列号 */
+    const val CMD_EARBUD_SN_R: Int = 0x15
 
     // ========== Cmd ID - ANC (Feature=0x40, 抓包确认) ==========
     /** ANC 状态查询 */
     const val CMD_ANC_QUERY: Int = 0x03
     /** ANC 模式设置: Payload=[mode] */
     const val CMD_ANC_SET: Int = 0x04
-    /** ANC 可用模式查询 */
-    const val CMD_ANC_AVAILABLE: Int = 0x29
+    /** ANC 切换配置读取（旧名“可用模式”有误） */
+    const val CMD_ANC_CONFIG_READ: Int = 0x29
+    /** ANC 切换配置写入 */
+    const val CMD_ANC_CONFIG_WRITE: Int = 0x2A
     /** ANC 状态异步推送 */
     const val CMD_ANC_NOTIFY: Int = 0x81
     /** ANC 错误通知 */
@@ -90,15 +104,38 @@ object GaiaConstants {
     /** LHDC 开关设置: Payload=[0/1] */
     const val CMD_LHDC_SET: Int = 0x06
 
-    // ========== Cmd ID - EQ 参数 (Feature=0x0A, btsnoop 确认, 格式待确认) ==========
-    const val CMD_EQ_BANDWIDTH: Int = 0x03
-    const val CMD_EQ_PARAM_QUERY: Int = 0x05
-    const val CMD_EQ_PARAM_SET: Int = 0x06
+    // ========== Cmd ID - EQ (Feature=0x0A, APK V3MusicProcessingPlugin 确认) ==========
+    const val CMD_EQ_STATE: Int = 0x00
+    const val CMD_EQ_AVAILABLE_PRESETS: Int = 0x01
+    const val CMD_EQ_READ_SET: Int = 0x02
+    const val CMD_EQ_WRITE_SET: Int = 0x03
+    const val CMD_EQ_USER_BAND_COUNT: Int = 0x04
+    const val CMD_EQ_USER_CONFIG_READ: Int = 0x05
+    const val CMD_EQ_USER_CONFIG_WRITE: Int = 0x06
+    const val CMD_EQ_SAVE_USER: Int = 0x07
+    const val CMD_EQ_WRITE_NV_ID: Int = 0x08
 
-    // ========== Cmd ID - 设备信息 (Feature=0x28, btsnoop 确认) ==========
-    const val CMD_DEVICE_INFO: Int = 0x01
-    const val CMD_DEVICE_SUBTYPE: Int = 0x03
-    const val CMD_CONNECTED_DEVICE_NAME: Int = 0x05
+    // ========== Cmd ID - 指示灯 (Feature=0x26, APK 确认) ==========
+    const val CMD_LED_GET: Int = 0x01
+    const val CMD_LED_SET: Int = 0x02
+
+    // ========== Cmd ID - 提示音 (Feature=0x1C, APK 确认) ==========
+    const val CMD_VOICE_GET: Int = 0x01
+    const val CMD_VOICE_SET: Int = 0x02
+
+    // ========== Cmd ID - 手势 (Feature=0x2C, APK 确认) ==========
+    const val CMD_TOUCH_DEFAULT: Int = 0x01
+    const val CMD_TOUCH_CURRENT: Int = 0x02
+    const val CMD_TOUCH_SET: Int = 0x03
+
+    // ========== Cmd ID - 一拖二 (Feature=0x28, APK 确认) ==========
+    const val CMD_OBT_STATUS: Int = 0x01
+    const val CMD_OBT_SET: Int = 0x02
+    const val CMD_OBT_TIMEOUT: Int = 0x03
+    const val CMD_OBT_TIMEOUT_SET: Int = 0x04
+    const val CMD_OBT_DEVICE_LIST: Int = 0x05
+    const val CMD_OBT_DEVICE_LIST_NEXT: Int = 0x06
+    const val CMD_OBT_DISCONNECT: Int = 0x07
 
     // ========== Cmd ID - 电池电量 (Feature=0x1A, README 确认) ==========
     /** 查询支持的电池 (Cmd=0x00) */
