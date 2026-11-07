@@ -320,8 +320,8 @@ powershell tools/fix_rfc.ps1
 # 一键启动：DEMO 模式
 run-demo.bat
 
-# 一键启动：真机，参数为 COM 口
-run-pudding.bat COM4
+# 一键启动：真机，自动检测蓝牙串口（也可手动指定，如 run-pudding.bat COM8）
+run-pudding.bat
 ```
 
 ## 构建与测试

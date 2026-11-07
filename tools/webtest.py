@@ -4,6 +4,7 @@
     python tools/webtest.py --demo                 # 假设备，完整面板
     python tools/webtest.py --demo --demo-noack    # 假设备模拟 SET 无 ACK
     python tools/webtest.py --port COM5            # 真机 SPP 串口
+    python tools/webtest.py --find-port            # 只打印自动检测到的串口
     python tools/webtest.py --web-port 9090        # 自定义 Web 端口
 
 面板覆盖: 降噪五档、手势 5 行 × 左右耳、电量、增益、指示灯、
@@ -2314,18 +2315,39 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _score_serial_port(port):
+    """给蓝牙串口打分：MOONDROP VID 优先，远端 SPP 服务端口次之，本机口最后。"""
+    hwid = (port.hwid or "").upper()
+    desc = (port.description or "").upper()
+    if "BTHENUM" in hwid:
+        if "1101" not in hwid:
+            return -1
+    elif not (("蓝牙" in desc or "BLUETOOTH" in desc)
+              and ("串行" in desc or "SERIAL" in desc)):
+        return -1
+
+    score = 0
+    if "05D6" in hwid:
+        score += 100
+    if "VID&" in hwid:
+        score += 30
+    if "LOCALMFG" in hwid:
+        score -= 100
+    return score
+
+
 def find_moondrop_port():
-    """自动查找 MOONDROP 蓝牙串口 (VID=0x05D6)，找不到再退回 RFCOMM 串口。"""
+    """自动查找 MOONDROP 蓝牙串口 (VID=0x05D6)，找不到再退回远端 SPP 串口。"""
     import serial.tools.list_ports
-    ports = list(serial.tools.list_ports.comports())
-    for port in ports:
-        if "05D6" in (port.hwid or "").upper():
-            return port.device
-    for port in ports:
-        hwid = (port.hwid or "").upper()
-        if "BTHENUM" in hwid and "1101" in hwid:
-            return port.device
-    return None
+    candidates = []
+    for port in serial.tools.list_ports.comports():
+        score = _score_serial_port(port)
+        if score >= 0:
+            candidates.append((score, port.device))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def main():
@@ -2335,6 +2357,7 @@ def main():
     demo = False
     demo_noack = False
     demo_latency = 0.0
+    find_port = False
     args = sys.argv[1:]
 
     i = 0
@@ -2366,12 +2389,19 @@ def main():
                 print(f"  无效延迟: {args[i + 1]}")
                 return
             i += 2
+        elif arg == "--find-port":
+            find_port = True
+            i += 1
         elif arg.upper().startswith("COM"):
             port = arg
             i += 1
         else:
             print(f"  忽略未知参数: {arg}")
             i += 1
+
+    if find_port:
+        print(port or find_moondrop_port() or "NONE")
+        return
 
     if demo:
         ser = MockSerial(noack=demo_noack, latency=demo_latency)
