@@ -7,7 +7,8 @@ package com.moondrop.protocol.model
  * ```
  * FF 04 [Len:2 BE] [Seq:1] [Vendor:1] [FeatureID:1] [CmdID:1] [Payload...]
  * ```
- * Len = 1 + 1 + payload.size (feature + cmd + payload)
+ * Len = payload.size
+ * 总包长 = 8 + payload.size
  */
 data class GaiaPacket(
     /** Feature ID */
@@ -19,7 +20,7 @@ data class GaiaPacket(
     /** 载荷数据 */
     val payload: ByteArray = byteArrayOf(),
 
-    /** 事务序号 */
+    /** 第 4 字节：抓包始终为 0x00，含义待确认（可能是 16 位 Vendor 的高字节） */
     val sequence: Byte = 0x00
 ) {
     /** 获取 cmdId (featureId shl 8 | commandId) */

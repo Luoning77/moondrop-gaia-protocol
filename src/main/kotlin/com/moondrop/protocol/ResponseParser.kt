@@ -36,9 +36,11 @@ object ResponseParser {
         return try { String(packet.payload, Charsets.US_ASCII).trim() } catch (_: Exception) { null }
     }
 
-    /** 解析 ANC 状态 (Feature=0x41, payload[0]=当前模式, 接受 query/set 响应) */
+    /** 解析 ANC 状态 (Feature=0x41, payload[0]=当前模式, 仅接受 query/set 响应) */
     fun parseAncMode(packet: GaiaPacket): AncMode? {
+        if (!GaiaConstants.isResponse(packet.featureId)) return null
         if (GaiaConstants.baseFeatureId(packet.featureId) != GaiaConstants.FEATURE_ANC) return null
+        if (packet.commandId != GaiaConstants.CMD_ANC_QUERY && packet.commandId != GaiaConstants.CMD_ANC_SET) return null
         if (packet.payload.isEmpty()) return null
         return AncMode.fromValue(packet.payload[0])
     }
@@ -46,20 +48,23 @@ object ResponseParser {
     /** 解析 ANC 可用模式 (Feature=0x41, Cmd=0x29)
      *  返回 5 字节：关闭/自适应/通透/抗风噪/降噪 可用标志 (0x01=可用) */
     fun parseAncAvailableModes(packet: GaiaPacket): List<Int> {
+        if (!GaiaConstants.isResponse(packet.featureId)) return emptyList()
         if (GaiaConstants.baseFeatureId(packet.featureId) != GaiaConstants.FEATURE_ANC) return emptyList()
         if (packet.commandId != GaiaConstants.CMD_ANC_AVAILABLE) return emptyList()
         if (packet.payload.isEmpty()) return emptyList()
         return packet.payload.map { it.toInt() and 0xFF }
     }
 
-    /** 解析 Gain 级别 (Feature=0x1F, payload[0]=当前级别, 接受 query/set 响应) */
+    /** 解析 Gain 级别 (Feature=0x1F, payload[0]=当前级别, 仅接受 query/set 响应) */
     fun parseGainLevel(packet: GaiaPacket): GainLevel? {
+        if (!GaiaConstants.isResponse(packet.featureId)) return null
         if (GaiaConstants.baseFeatureId(packet.featureId) != GaiaConstants.FEATURE_GAIN) return null
+        if (packet.commandId != GaiaConstants.CMD_GAIN_QUERY && packet.commandId != GaiaConstants.CMD_GAIN_SET) return null
         if (packet.payload.isEmpty()) return null
         return GainLevel.fromValue(packet.payload[0])
     }
 
-    /** 解析 LDAC 状态 (Feature=0x21, Cmd=0x05) */
+    /** 解析 LDAC 状态 (Feature=0x21, Cmd=0x02) */
     fun parseLdacStatus(packet: GaiaPacket): Boolean? {
         if (packet.featureId != (GaiaConstants.FEATURE_CODEC or GaiaConstants.RESPONSE_BIT)) return null
         if (packet.commandId != GaiaConstants.CMD_LDAC_STATUS) return null
@@ -75,11 +80,21 @@ object ResponseParser {
         return packet.payload[0] == 0x01.toByte()
     }
 
-    fun isError(packet: GaiaPacket): Boolean {
-        return packet.payload.isNotEmpty() && packet.payload[0] == 0xFE.toByte()
+    /** 解析 LHDC 状态 (Feature=0x21, Cmd=0x05) */
+    fun parseLhdcStatus(packet: GaiaPacket): Boolean? {
+        if (packet.featureId != (GaiaConstants.FEATURE_CODEC or GaiaConstants.RESPONSE_BIT)) return null
+        if (packet.commandId != GaiaConstants.CMD_LHDC_STATUS) return null
+        if (packet.payload.isEmpty()) return null
+        return packet.payload[0] == 0x01.toByte()
     }
 
+    /** 错误帧：响应 Feature (bit0=1) 且 Cmd 带错误位 (0x80) */
+    fun isError(packet: GaiaPacket): Boolean {
+        return GaiaConstants.isResponse(packet.featureId) && GaiaConstants.isErrorCommand(packet.commandId)
+    }
+
+    /** 成功响应：响应 Feature (bit0=1) 且不是错误帧 */
     fun isSuccess(packet: GaiaPacket): Boolean {
-        return packet.payload.isEmpty() || packet.payload[0] == 0x00.toByte()
+        return GaiaConstants.isResponse(packet.featureId) && !GaiaConstants.isErrorCommand(packet.commandId)
     }
 }

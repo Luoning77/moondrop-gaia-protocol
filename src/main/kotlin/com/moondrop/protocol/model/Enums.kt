@@ -15,7 +15,9 @@ enum class AncMode(val value: Byte, val label: String, val available: Boolean = 
 
     companion object {
         private val map = entries.associateBy { it.value }
-        fun fromValue(value: Byte): AncMode = map[value] ?: OFF
+
+        /** 未定义的值返回 null，避免把错误/未知状态静默当成 OFF。 */
+        fun fromValue(value: Byte): AncMode? = map[value]
     }
 }
 
@@ -29,6 +31,8 @@ enum class GainLevel(val value: Byte, val label: String) {
 
     companion object {
         private val map = entries.associateBy { it.value }
-        fun fromValue(value: Byte): GainLevel = map[value] ?: MEDIUM
+
+        /** 未定义的值返回 null，避免把错误/未知状态静默当成 MEDIUM。 */
+        fun fromValue(value: Byte): GainLevel? = map[value]
     }
 }

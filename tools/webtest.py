@@ -270,6 +270,7 @@ class MockSerial:
         self.noack = bool(noack)
         self.latency = max(0.0, float(latency))
         self._rx = bytearray()
+        self._pending = bytearray()      # 上次 write 遗留的半帧
 
         self._anc = 0x01                 # 自适应
         self._anc_cfg = [1, 1, 1, 1, 1]  # STATE, ON, OFF, TRANSPARENT, ORDER
@@ -309,7 +310,9 @@ class MockSerial:
         self.is_open = False
 
     def write(self, data):
-        data = bytes(data)
+        # 拼接上次遗留的半帧，支持一个帧被拆成多次写入。
+        data = bytes(self._pending) + bytes(data)
+        self._pending = bytearray()
         replies = bytearray()
         try:
             rest = data
@@ -320,8 +323,11 @@ class MockSerial:
                     break
                 replies += self._handle(rest[:total])
                 rest = rest[total:]
+            if rest:
+                self._pending = bytearray(rest)
         except Exception:
             replies = bytearray()
+            self._pending = bytearray()
         if self.latency:
             time.sleep(self.latency)
         self._rx += replies
@@ -625,7 +631,7 @@ def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
 
 def _payload_of(result):
     d = result.get("decoded") if result else None
-    if not d or d.get("frame_type") == "error":
+    if not d or d.get("frame_type") in ("error", "notification"):
         return None
     return d.get("payload")
 
@@ -943,7 +949,12 @@ def set_tone(enabled=None, volume=None, index=None):
         before = [before[0] & 0x01, before[1] & 0xFF, before[2] & 0xFF]
     else:
         before = None
-    base = before or [1, 60, 1]
+    if before is not None:
+        base = before
+    elif enabled is None or volume is None or index is None:
+        raise ValueError("读取当前提示音失败，无法补齐未指定的字段；请同时提供 enabled、volume、index")
+    else:
+        base = [enabled, volume, index]
 
     enabled = base[0] if enabled is None else enabled
     volume = base[1] if volume is None else volume
@@ -982,6 +993,8 @@ def set_tone(enabled=None, volume=None, index=None):
         message = f"重读值 {_fmt_value(after)} 与写入值 {_fmt_value(requested)} 不一致"
 
     extra = {"before": before, "requested": requested, "after": after}
+    if before is None:
+        extra["warning"] = "写入前无法读取当前提示音，已按提交的完整 3 字节写入"
     if set_error:
         extra["set_error"] = set_error
     return _finish("设置提示音", steps, ok, message, **extra)
@@ -2044,6 +2057,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path in ("/", "/index.html"):
             self._html(HTML)
             return
+        is_write = parsed.path == "/api/send" or parsed.path.startswith("/api/set/")
+        if is_write and not self._same_origin_request():
+            self._json({"error": "拒绝跨源写入请求"}, 403)
+            return
         try:
             query = parse_qs(parsed.query)
             result = self._route(parsed.path, query)
@@ -2057,6 +2074,27 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "未知接口"}, 404)
         else:
             self._json(result)
+
+    def _same_origin_request(self):
+        """拒绝浏览器发起的跨源写请求。
+
+        无 Origin/Referer 的调用（curl、脚本）放行；现代浏览器的
+        Sec-Fetch-Site 会直接暴露跨站请求，旧浏览器则靠 Origin/Referer 判断。
+        """
+        site = self.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return False
+        host = (self.headers.get("Host") or "").strip()
+        if not host:
+            return True
+        expected = f"http://{host}"
+        origin = self.headers.get("Origin")
+        if origin and origin.rstrip("/") != expected:
+            return False
+        referer = self.headers.get("Referer")
+        if referer and not (referer == expected or referer.startswith(expected + "/")):
+            return False
+        return True
 
     def _route(self, path, q):
         global device_online

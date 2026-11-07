@@ -10,10 +10,13 @@ import com.moondrop.protocol.model.GaiaPacket
  * ```
  * FF 04 [Len:2 BE] [Seq:1] [Vendor:1] [FeatureID:1] [CmdID:1] [Payload...]
  * ```
- * Len = 1 + 1 + payload.size (feature + cmd + payload)
+ * Len = payload.size
  * 总包长 = 8 + payload.size
  */
 object GaiaCodec {
+
+    /** 单帧 payload 上限。超过视为长度字段损坏，按错帧丢弃并重新同步。 */
+    const val MAX_PAYLOAD: Int = 512
 
     // ========== 编码 ==========
 
@@ -40,16 +43,26 @@ object GaiaCodec {
 
     // ========== 解码 ==========
 
+    /**
+     * 解码单帧。
+     *
+     * 要求 `data.size >= 8 + Len`，且 Len 不超过 [MAX_PAYLOAD]；
+     * 末尾多余字节会被忽略，只截取 Len 声明的 payload（与 `webtest.decode_packet` 一致）。
+     */
     fun decode(data: ByteArray): GaiaPacket? {
         if (data.size < 8) return null
         if (data[0].toInt() and 0xFF != 0xFF || data[1].toInt() and 0xFF != 0x04) return null
 
         val vendorId = data[5].toInt() and 0xFF
-        if (vendorId != GaiaConstants.VENDOR_ID) return null
+        if (vendorId != (GaiaConstants.VENDOR_ID and 0xFF)) return null
+
+        val len = ((data[2].toInt() and 0xFF) shl 8) or (data[3].toInt() and 0xFF)
+        if (len > MAX_PAYLOAD) return null
+        if (data.size < 8 + len) return null
 
         val featureId = data[6].toInt() and 0xFF
         val commandId = data[7].toInt() and 0xFF
-        val payload = if (data.size > 8) data.copyOfRange(8, data.size) else byteArrayOf()
+        val payload = if (len > 0) data.copyOfRange(8, 8 + len) else byteArrayOf()
 
         return GaiaPacket(featureId = featureId, commandId = commandId, payload = payload, sequence = data[4])
     }
@@ -93,6 +106,11 @@ object GaiaCodec {
                     continue
                 }
                 val len = (buffer[head + 2].toInt() and 0xFF shl 8) or (buffer[head + 3].toInt() and 0xFF)
+                if (len > MAX_PAYLOAD) {
+                    // 长度字段不可信：丢弃 1 字节重新同步，避免后续正常帧被一起卡住。
+                    head++
+                    continue
+                }
                 val totalLen = 8 + len
                 if (tail - head < totalLen) break
                 val decoded = decode(buffer.copyOfRange(head, head + totalLen))

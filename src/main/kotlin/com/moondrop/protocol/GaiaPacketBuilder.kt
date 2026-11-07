@@ -1,6 +1,7 @@
 package com.moondrop.protocol
 
 import com.moondrop.protocol.model.AncMode
+import com.moondrop.protocol.model.GainLevel
 import com.moondrop.protocol.model.GaiaPacket
 
 /**
@@ -40,12 +41,20 @@ object GaiaPacketBuilder {
 
     fun gainQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_GAIN, GaiaConstants.CMD_GAIN_QUERY)
     fun gainSet(level: Byte): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_GAIN, GaiaConstants.CMD_GAIN_SET, byteArrayOf(level))
+    fun gainSet(level: GainLevel): GaiaPacket = gainSet(level.value)
 
     // ========== 编解码器 (Feature 0x20) ==========
 
-    fun ldacStatusQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_CODEC, GaiaConstants.CMD_LDAC_STATUS)
     fun lc3StatusQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_CODEC, GaiaConstants.CMD_LC3_STATUS)
-    fun codecSet(codecId: Byte, value: Byte): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_CODEC, GaiaConstants.CMD_CODEC_SET, byteArrayOf(codecId, value))
+    fun ldacStatusQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_CODEC, GaiaConstants.CMD_LDAC_STATUS)
+    fun lhdcStatusQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_CODEC, GaiaConstants.CMD_LHDC_STATUS)
+
+    fun lc3Set(enabled: Boolean): GaiaPacket = codecSet(GaiaConstants.CMD_LC3_SET, enabled)
+    fun ldacSet(enabled: Boolean): GaiaPacket = codecSet(GaiaConstants.CMD_LDAC_SET, enabled)
+    fun lhdcSet(enabled: Boolean): GaiaPacket = codecSet(GaiaConstants.CMD_LHDC_SET, enabled)
+
+    private fun codecSet(commandId: Int, enabled: Boolean): GaiaPacket =
+        GaiaPacket(GaiaConstants.FEATURE_CODEC, commandId, byteArrayOf(if (enabled) 0x01 else 0x00))
 
     // ========== 探测 ==========
 
