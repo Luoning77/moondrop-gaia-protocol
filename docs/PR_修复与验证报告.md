@@ -16,6 +16,8 @@
 
 第二轮复审（针对 `3fa7ab9`）确认上述 5 项已完成，同时指出同一类缺陷在读取路径仍有残留：多个入口以「解出了一帧」为成功或在线依据。该问题（记作问题 6）已在本报告 6.1 节记录，修复提交 `b531a95`，并补充了 10 条回归测试。
 
+其后又做了两轮针对性复查：6.2 节记录链路静默守卫（`9ac8484`），6.3 节记录复查追加的四项（`360efb6`，其中 R3 会让成功的写入被报成失败）。测试总数从 20 增至 40。
+
 ---
 
 ## 1. 修复对应关系
@@ -62,14 +64,14 @@
 | 项目 | 内容 |
 |---|---|
 | 命令 | `python -m pytest tools\test_webtest.py -q`（仓库根目录） |
-| 结果 | **32 passed**，耗时 6.08 s（第一轮修复后为 20 个用例、约 3.1 s；第二轮补齐读取路径判据后增至 30 个，加入链路静默守卫后 32 个） |
+| 结果 | **40 passed**，耗时 9.05 s（第一轮 20 个 → 第二轮补齐读取路径判据 30 个 → 链路静默守卫 32 个 → 复查四项 40 个） |
 | 修复前基线 | **16 failed / 4 passed**（同一测试文件在评审基线 `0a3c868` 的 `webtest.py` 上运行，约 4～5 s） |
 | 编译检查 | `python -m py_compile tools\webtest.py` → exit 0 |
 | Python | 3.14.2 |
 | pytest | 9.1.1 |
 | pyserial | 3.5 |
 | 平台 | Windows 10 专业版（10.0.19045） |
-| 测试文件 | `tools/test_webtest.py`，1042 行，32 个用例 |
+| 测试文件 | `tools/test_webtest.py`，1241 行，40 个用例 |
 
 测试不依赖真实蓝牙：用实现了 pyserial 子集的 `FakeSerial`（`in_waiting` / `read` / `write` / `flush` / `reset_input_buffer` / `is_open` / `port`）注入应答，因此重试次数、坏帧重同步等断言都来自「实际 write 次数」和「注入字节序列」，不靠 sleep 计时。所有重试相关用例的 `timeout` 取 0.12～0.2 s，全套 20 个用例约 3.1 s 完成。
 
@@ -77,8 +79,8 @@
 
 ```
 $ python -m pytest tools\test_webtest.py -q
-................................                                         [100%]
-32 passed in 6.08s
+........................................                                 [100%]
+40 passed in 9.05s
 ```
 
 ```
@@ -115,6 +117,14 @@ tools/test_webtest.py::test_issue6_firmware_matched_response_still_works PASSED
 tools/test_webtest.py::test_issue6_api_status_online_requires_connected PASSED
 tools/test_webtest.py::test_issue6_read_state_aborts_on_dead_link PASSED
 tools/test_webtest.py::test_issue6_read_state_does_not_abort_on_device_errors PASSED
+tools/test_webtest.py::test_issue6_api_check_uses_same_probe_ladder PASSED
+tools/test_webtest.py::test_issue6_read_state_no_link_fails_fast PASSED
+tools/test_webtest.py::test_issue6_read_state_stops_when_only_notifications PASSED
+tools/test_webtest.py::test_issue6_read_state_guard_stops_on_silent_tail PASSED
+tools/test_webtest.py::test_issue6_read_state_keeps_going_on_device_errors PASSED
+tools/test_webtest.py::test_issue6_refresh_all_requires_state_data PASSED
+tools/test_webtest.py::test_issue6_set_noack_with_notification_is_not_failure PASSED
+tools/test_webtest.py::test_issue6_set_unmatched_other_command_still_fails PASSED
 ```
 
 用例与评审编号的对应：
@@ -126,7 +136,7 @@ tools/test_webtest.py::test_issue6_read_state_does_not_abort_on_device_errors PA
 | 3 | `test_issue3_set_rejected_but_state_already_expected`、`test_issue3_touch_rejected_but_state_already_expected`、`test_issue3_tone_rejected_but_state_already_expected`、`test_issue3_set_noack_still_ok` |
 | 4 | `test_issue4_python_summary_unknown_codec`（Python 侧镜像防护，Kotlin 侧见 2.2） |
 | 5 | `test_issue5_bad_len_resync`、`test_issue5_bad_len_resync_recv_frame`、`test_issue5_split_and_coalesced`、`test_decode_packet_oversized_len`、`test_decode_packet_accepts_max_len`、`test_issue5_bad_vendor_resync`、`test_issue5_len_513_resync`、`test_issue5_cross_frame_swallow`、`test_issue5_mockserial_bad_len` |
-| 6 | 12 条 `test_issue6_*`，逐条对应关系见 6.1 与 6.2 节 |
+| 6 | 20 条 `test_issue6_*`，逐条对应关系见 6.1、6.2、6.3 节 |
 
 **红阶段（修复前）基线**：把测试文件放到评审当时的提交 `0a3c868` 的 `tools/webtest.py` 上运行（仓库外临时目录，不改仓库文件），得到 `16 failed, 4 passed in 4.87s`。4 个通过项均为有意设置的「回归基准」，不是问题复现不出来：`test_issue2_matched_error_frame_counts_as_matched`、`test_issue3_set_noack_still_ok`、`test_issue5_split_and_coalesced`、`test_decode_packet_accepts_max_len`。代表性失败输出：
 
@@ -443,36 +453,77 @@ systemProp.https.proxyPort=7890
 
 真机验证（Pudding，固件 3.5.6，COM8）：`read_state` 返回 11 项、`firmware=3.5.6`、`online=True`、`answered=True`；`/api/status` 与 `/api/check` 的 `connected`/`online`/`answered` 均正确；设备拒绝命令时 `answered=False` 但 `online` 保持为真；单独发 `00 05` 仍 `ok=True`（加固未影响正常路径）；手势读取 `ok=True` 且 payload 5 字节。DEMO 三种模式（`--demo`、`--demo-noack`、`--demo-latency 0.1`）回归正常。
 
-`python -m pytest tools\test_webtest.py -q` → **32 passed in 6.08s**。
+`python -m pytest tools\test_webtest.py -q` → **40 passed in 9.05s**。
 
 ### 6.2 链路静默时提前结束读取（`9ac8484` 之后）
 
 `read_state()` 顺序读 13 条命令，每条各有超时。若链路在中途静默（只推送通知、或探活后设备断连），剩余每条都会等满自己的超时，最坏约 17s 才返回，期间页面一直转圈。
 
-修复：**连续 2 条命令零接收即结束读取**，结果带 `aborted_early` 标记，已读到的值保留。
+修复：**连续 3 条命令未得到本次请求的应答即结束读取**，结果带 `aborted_early` 标记，已读到的值保留。
 
-判据是 `rx_raw` 为空（一个字节都没收到），而不是「没有匹配的响应」。所以：
+判据是 `_step_answered()` 为假，同时覆盖两种静默：
 
-- 设备回错误帧 → 算有接收，继续读（真机上 LC3/LDAC 就是回错误帧）
-- 设备回无关帧 → 算有接收，继续读
-- 只有真正静默才触发
+- 一个字节都没收到
+- 只收到无关通知（通知有 `rx_raw`，但没有证明设备处理了本次请求）
+
+设备回错误帧算已应答，不会触发退出 —— 真机上 LC3/LDAC 回的就是错误帧。阈值取 3 而不是 2，是给「某条命令确实不支持」留余量，避免连续两条不支持就误判断连。
+
+另：串口未打开（`no_link` / `write_failed`）时立即返回，不再逐项刷出若干条 `no_link`；所有提前返回分支的键与正常分支一致（含 `connected` / `aborted_early`）。
 
 覆盖测试：
 
 | 用例 | 断言 |
 |---|---|
-| `test_issue6_read_state_aborts_on_dead_link` | 前两项正常、之后静默 → `aborted_early=True`、steps ≤ 5、已读值保留 |
-| `test_issue6_read_state_does_not_abort_on_device_errors` | LC3/LDAC 连续两条错误帧 → `aborted_early=False`、13 步读完、错误帧之后的项仍读到 |
+| `test_issue6_read_state_aborts_on_dead_link` | 前两项正常、之后静默 → `aborted_early=True`、已读值保留 |
+| `test_issue6_read_state_keeps_going_on_device_errors` | 连续错误帧 → `aborted_early=False`、13 步读完、后续项仍读到 |
+| `test_issue6_read_state_guard_stops_on_silent_tail` | 探活正常、之后只收到通知 → 守卫触发，不跑满 13 步 |
+| `test_issue6_read_state_no_link_fails_fast` | 串口未打开 → `connected=False`、`aborted_early=False`、steps ≤ 2 |
 
-红绿验证：去掉守卫后 `test_issue6_read_state_aborts_on_dead_link` 失败（`aborted_early=False`、跑满 13 步）。
+红绿验证：把守卫判据改回 `rx_raw` 后，`test_issue6_read_state_guard_stops_on_silent_tail` 失败（跑满 13 步、`aborted_early=False`）。
 
-**该改动的真机验证未完成**：验证时 COM8 已无法打开（设备断开），因此「正常链路下守卫不误触发」这一条只有单元测试证据，没有真机证据。预期行为是完整读取仍返回 13 步、`aborted_early=False`；若有疑虑可在设备可用时用 `read_state()` 直接确认。
+**该改动的真机验证未完成**：验证时 COM8 已无法打开（设备断开），因此「正常链路下守卫不误触发」这一条只有单元测试证据。DEMO 三种模式下完整读取均返回 13 步、无零接收步骤，可作为间接佐证。
 
-### 6.3 已知但影响有限、未处理的项
+### 6.3 复查追加的四项（`360efb6`）
+
+在上一轮提交后再做了一次针对性复查，发现四处同类问题，其中两处影响判定结果而非仅文案：
+
+| 编号 | 位置 | 问题 | 处理 |
+|---|---|---|---|
+| R1 | `/api/check` | 没有接上 `read_state` 的两级探活，同一台设备两个接口结论可能相反（固件无回帧、电量有应答时，`/api/check` 报离线而 `/api/state` 报在线） | 抽出 `_probe_device()` 供两处共用 |
+| R2 | 前端 `refreshAll()` | `if(data.online)` 判刷新成功。设备在线但拒绝全部读取时 `online=true`、`state` 为空，仍提示「状态已刷新」而面板全是 `—` | 改为要求 `answered` 且 `state` 非空；设备拒绝时提示「设备已应答但拒绝了全部读取」 |
+| R3 | `_classify_write()` / `_write_no_reply_ok()` | SET 无 ACK 时若写窗口内恰来一条异步通知（如 `40 84`），`matched=False` 但 `decoded` 非空，被直接判「未收到匹配的响应帧」，成功的写入被报成失败。该缺陷在 `3fa7ab9` 上已存在 | 新增 `_only_notifications()`；只有收到「其它命令的响应/错误帧」才直接判失败，通知噪声走写后重读判定 |
+| R4 | `read_state()` 守卫 | 判据用 `rx_raw`，通知帧有值 → 只推送通知的链路仍跑满 13 步；串口未打开时会刷 2~3 条 `no_link`；提前返回分支缺 `connected`/`aborted_early` 键 | 判据改为 `_step_answered()`、阈值 3；`no_link`/`write_failed` 直接返回；补齐返回键 |
+
+覆盖测试（新增 8 条）：
+
+| 用例 | 断言 |
+|---|---|
+| `test_issue6_api_check_uses_same_probe_ladder` | 固件无回帧、电量有应答 → `/api/check.online=True` 且与 `read_state().online` 一致 |
+| `test_issue6_read_state_no_link_fails_fast` | 串口未打开 → `connected=False`、`aborted_early=False`、steps ≤ 2 |
+| `test_issue6_read_state_stops_when_only_notifications` | 只有通知 → `online=False`、`state={}`、尽早收工 |
+| `test_issue6_read_state_guard_stops_on_silent_tail` | 探活正常后只收到通知 → 守卫触发 |
+| `test_issue6_read_state_keeps_going_on_device_errors` | 回归基准：错误帧不算静默 |
+| `test_issue6_refresh_all_requires_state_data` | `refreshAll` 使用 `data.answered`，不再用 `data.online` 判成功 |
+| `test_issue6_set_noack_with_notification_is_not_failure` | SET 无 ACK + 窗口内通知 + 重读一致 → `ok=True`、`message='写入后重读一致'` |
+| `test_issue6_set_unmatched_other_command_still_fails` | 回归基准：收到其它命令的响应帧仍判失败（防止放宽过度） |
+
+红绿验证（逐项在仓库外副本回退）：
+
+| 回退项 | 变红的测试 |
+|---|---|
+| R1（`/api/check` 改回单发） | `test_issue6_api_check_uses_same_probe_ladder` |
+| R2（`refreshAll` 改回 `data.online`） | `test_issue6_refresh_all_requires_state_data` |
+| R3（`_classify_write` 去掉 `_only_notifications`） | `test_issue6_set_noack_with_notification_is_not_failure` |
+| R4（守卫改回 `rx_raw`、阈值 2） | `test_issue6_read_state_guard_stops_on_silent_tail` |
+
+DEMO 三模式回归：`--demo`、`--demo-noack`、`--demo-latency 0.1` 均为 13 步、13 项状态、无零接收步骤、`aborted_early=False`，设备拒绝与 SET 行为正常。
+
+### 6.4 已知但影响有限、未处理的项
 
 | 项 | 现状 | 影响 |
 |---|---|---|
 | `probe_status` 里的 `unparsed` 分支 | `_take_frame` 已校验 vendor/len，裸 PDU 也保证 ≥4 字节可解，实际不可达 | 无。保留作为防御，不必为它写测试；但不要因此回退到用 `decoded` 判据 |
+| `answered` 字段的命名 | 当前语义是「至少一项成功」，而不是「设备应答了」（后者由 `online` 表达） | 无消费者（HTML 未使用），改名会牵连现有测试，本轮只在文档说明 |
 
 ---
 
