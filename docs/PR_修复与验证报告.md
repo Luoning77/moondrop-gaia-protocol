@@ -151,6 +151,21 @@ BUILD SUCCESSFUL in 8s
 
 **关于 `--rerun-tasks`**：第一次执行 `.\gradlew.bat test --offline`（不带 `--rerun-tasks`）时，`:test` 任务为 `UP-TO-DATE`（Gradle 增量判定，实际未执行测试），此时 XML 是上一次的结果，不能作为本次修复的验证证据。因此改用 `--rerun-tasks` 强制重跑，得到 `BUILD SUCCESSFUL in 10s`、`4 actionable tasks: 4 executed`，测试报告 XML 时间戳随之更新为 `2026-11-09T11:45:11Z`，内容为 `tests=50 failures=0 errors=0 skipped=0 time=0.395`。本报告表格中的 `11:51:58Z / time=0.341` 是撰写本报告时再次强制重跑的结果，与 `11:45:11Z` 那次一致（同为 50 全绿）。结论以「用 `--rerun-tasks` 强制重跑确认」为准，不采信 UP-TO-DATE 的旧结果。
 
+### 2.3 完整构建（`build`，含单元测试）
+
+评审原文要求「Kotlin 至少运行 `./gradlew build`（含单元测试）」，已补跑完整构建（此前只跑了 `test`）：
+
+| 项目 | 内容 |
+|---|---|
+| 命令 | `.\gradlew.bat clean build --console=plain` |
+| 结果 | `BUILD SUCCESSFUL in 32s`，`5 actionable tasks: 5 executed` |
+| 执行的任务 | `:clean` → `:compileKotlin` → `:jar` → `:assemble` → `:compileTestKotlin` → `:test` → `:check` → `:build` |
+| 测试计数 | `tests=50 failures=0 errors=0 skipped=0`（XML 时间戳 `2026-11-09T12:34:55Z`，`time=0.965`） |
+| 构建产物 | `build/libs/moondrop-pudding-protocol-0.1.0.jar`（25,229 字节） |
+| 代理 | 仓库内 `gradle.properties` 的 `127.0.0.1:7890`，本机代理已在该端口监听，构建联网正常 |
+
+`clean` 确保不是增量复用旧产物；`5 actionable tasks: 5 executed` 表明各任务实际执行而非 `UP-TO-DATE`。
+
 **红绿验证**：把 `parseCodecSwitch()` 临时回退成旧实现（`return packet.payload[0] == 0x01.toByte()`）后重跑，`BUILD FAILED`，`tests=50 failures=4`，失败用例正是 0x02/0xFF 分支的 4 条：
 
 ```
@@ -328,26 +343,28 @@ systemProp.https.proxyHost=127.0.0.1
 systemProp.https.proxyPort=7890
 ```
 
-本机实测结果：
+该配置本身没有问题：本机代理在 `7890` 端口监听时，`.\gradlew.bat clean build` 直接联网成功（第 2.3 节），无需任何覆盖。只有当代理运行在其他端口时，才需要按下表处理。
+
+以下为「代理不在 7890 时」的实测结果，供其他环境参考：
 
 | 现象 | 实测 |
 |---|---|
-| `127.0.0.1:7890` 是否监听 | 未监听（TcpClient 连接超时） |
-| `127.0.0.1:7897` 是否监听 | 监听（本机实际使用的代理端口） |
-| PowerShell 未加引号传 `-Dhttps.proxyPort=7897` | 构建直接失败：`Task '.proxyPort=7897' not found in root project 'moondrop-pudding-protocol'`。用一个探测批处理确认根因：PowerShell 调用 `.bat` 时把该参数拆成了 `-Dhttps` + `.proxyPort=7897`（cmd.exe 下则完整传递）。这很可能是「命令行 `-D` 压不过 `systemProp`」这一印象的来源。 |
-| PowerShell 加引号传 `'-Dhttps.proxyPort=7897'` | 通过 init script 打印 system property 验证：`https.proxyPort=7897`，**覆盖成功**，`systemProp` 不是不可覆盖的 |
-| 同上，但 `--no-daemon` | 同样为 `7897`，排除 daemon 缓存旧值的干扰 |
-| cmd.exe 中未加引号传 `-Dhttps.proxyPort=7897` | 同样为 `7897`，覆盖成功 |
+| `127.0.0.1:7890` 未监听时直接构建 | 配置阶段失败：Gradle wrapper 下载报 `java.net.ConnectException` |
+| 改用代理实际端口（如 `7897`）时的 `--offline` 方式 | 可行，前提是 wrapper 发行包与依赖已在 `~/.gradle` 缓存 |
+| PowerShell 未加引号传 `-Dhttps.proxyPort=7897` | 构建失败：`Task '.proxyPort=7897' not found in root project 'moondrop-pudding-protocol'`。探测批处理确认根因：PowerShell 调用 `.bat` 时把该参数拆成 `-Dhttps` + `.proxyPort=7897`（cmd.exe 下则完整传递）。这就是「命令行 `-D` 压不过 `systemProp`」这一印象的来源。 |
+| PowerShell 加引号传 `'-Dhttps.proxyPort=7897'` | 通过 init script 打印 system property 验证：`https.proxyPort=7897`，**覆盖成功** |
+| 同上，但 `--no-daemon` | 同样生效，排除 daemon 缓存旧值的干扰 |
+| cmd.exe 中未加引号传 `-Dhttps.proxyPort=7897` | 同样覆盖成功 |
 
-结论（按实测修正）：在 PowerShell 里按常规写法传 `-D` 时，`systemProp.*` 实际生效，代理仍指向不可用的 7890，构建在配置阶段失败——从结果看确实「压不过」。但根因不是 Gradle 的优先级，而是 PowerShell 调用 `.bat` 时把 `-Dhttps.proxyPort=7897` 拆成了两个 token，Gradle 只收到残缺参数。换成加引号的写法（或在 cmd.exe 下）即可正常覆盖。由于这一写法差异对使用者不直观、且 `gradlew.bat` 的报错（`Task '.proxyPort=7897' not found`）指向任务名而非参数，实际使用中仍建议按「`--offline` 或临时改 `gradle.properties`」处理。
+结论：`systemProp.*` 可以被正确的命令行 `-D` 覆盖；之前观察到的「覆盖无效」是 PowerShell 参数被拆分导致的假象。但该写法对使用者不直观，且 `gradlew.bat` 的报错（`Task '.proxyPort=7897' not found`）指向任务名而非参数，容易误判为代理问题。若代理不在 7890，推荐顺序为：先把代理端口调到 7890（与仓库配置一致，最省事）→ 用 `--offline`（依赖已缓存时）→ 加引号的 `-D` 覆盖 → 临时改 `gradle.properties`（测完还原）。
 
-本次验证的规避方式：**不改仓库配置**，使用 `--offline` 配合已缓存的依赖完成构建（`~/.gradle/wrapper/dists/gradle-9.4.1-bin` 已存在，`gradle-9.4.1-bin.zip.ok` 标记完整；首次构建需下载 130MB 发行包，本次未触发下载）。若需要在干净环境联网构建，可选任一方式：临时修改 `gradle.properties` 的代理端口；或用 PowerShell 加引号的 `-Dhttps.proxyHost=127.0.0.1 '-Dhttps.proxyPort=7897'`（注意 http/https 两组都要传，实测只传 https 时 `http.proxyPort` 仍为 7890）。该环境问题不随 PR 修改 `gradle.properties`，避免把个人代理配置带入仓库。
+本次完整构建采用第一种方式（代理监听 7890），**未改动仓库配置**。无论采用哪种方式，都不应把个人代理端口提交进 `gradle.properties`。
 
-### 5.2 未运行的检查
+### 5.2 检查覆盖情况
 
 | 检查 | 状态 | 原因 |
 |---|---|---|
-| `./gradlew build`（完整构建） | **未运行** | 评审要求「Kotlin 至少运行 `./gradlew build`（含单元测试）」，本次实际只运行了 `test`。原因：任务范围仅涉及单元测试；`build` 比 `test` 多出的主要是 `assemble` 打包步骤，而本仓库 `build.gradle.kts` 未配置 detekt/ktlint 等静态检查插件。需要说明的是，本次 `test` 执行过程中 `:jar` 已被触发（构建输出含 `> Task :jar`），但 `build` 任务本身未执行，故不应据此推断「完整构建成功」。 |
+| `./gradlew build`（完整构建） | **已运行（通过）** | 见第 2.3 节：`.\gradlew.bat clean build` → `BUILD SUCCESSFUL in 32s`，`5 actionable tasks: 5 executed`，`tests=50 failures=0`，产物 `build/libs/moondrop-pudding-protocol-0.1.0.jar`。 |
 | Android 端集成验证 | **未做** | 本仓库是纯 Kotlin 协议库（`build.gradle.kts` 仅应用 `org.jetbrains.kotlin.jvm`，`jvmToolchain(17)`），无 Android 模块，不存在该类验证对象。 |
 | Python 3.8 真实环境验证 | **未做** | 代码按 Python 3.8+ 编写（未使用 3.9+ 语法特性），但只在 Python 3.14.2 上实际运行过。 |
 | 真机验证 | **部分完成** | 见第 4 节：只读读取、写入路径、面板端到端已验证；通知抢先到达、Len 损坏、蓝牙重协商未验证。 |
@@ -388,11 +405,10 @@ systemProp.https.proxyPort=7890
    - 一拖二与提示音的实际听感：仅验证协议层读写。
 
    已确认的真机行为（第 4.5 节）与 DEMO 假设有两处差异，后续若调整 DEMO 假设备应以此为准：真机 SET **会**回 ACK；设备对越界参数**回正向 ACK 但不生效**（校验责任在上位机）。
-2. **完整构建**：在联网或临时改代理的条件下执行 `./gradlew build`（含单元测试与打包），确认 `build` 任务本身通过，补上第 5.2 节标注的空缺。
-3. **EQ 语义与基础域 `0x00` 命令语义的后续校正**：依据仓库外的逆向审计记录 `D:\DSHarness\moondrop\_inspect\apk_control_id_audit.md`（该文件不随 PR 提交），至少包含：
+2. **EQ 语义与基础域 `0x00` 命令语义的后续校正**：依据仓库外的逆向审计记录 `D:\DSHarness\moondrop\_inspect\apk_control_id_audit.md`（该文件不随 PR 提交），至少包含：
    - 基础域 `0x00`：`0x07` 在 APK 中是「注册通知」而非「EQ 状态」，`0x0C`/`0x0D` 是传输信息/传输参数（`0x0D` 为写），`0x14`/`0x15` 分别是左耳/右耳序列号而非通用序列号/设备 ID；当前 `PRESETS`、`MockSerial` 基础域与 `_summarize` 的标签需同步 APK 语义；
    - EQ 域 `0x0A`：`0x00` 为 EQ 状态、`0x03` 为写 EQ Set、`0x05`/`0x06` 为读/写用户配置，与现有「带宽/参数读/参数写」的命名不完全一致，需按 `V3MusicProcessingPlugin` 重新命名并复核 `0x05`/`0x06` 的读写方向。
-4. **同类解析器未知值语义**：`parseCodecSwitch` 已改为三态，但其它布尔型解析器仍会把未定义值静默归入某个合法状态，本轮按「不改协议常量、不改其它解析器」的范围约束未改动：
+3. **同类解析器未知值语义**：`parseCodecSwitch` 已改为三态，但其它布尔型解析器仍会把未定义值静默归入某个合法状态，本轮按「不改协议常量、不改其它解析器」的范围约束未改动：
    - `parseLed`（`ResponseParser.kt:102–108`）与 `parseOnebringtwoState`（第 131–137 行）用 `(payload[0] and 0x01) == 1` 判定，`0x02` 之类的未定义值会被静默判为 false；
    - `parseVoiceConfig`（第 111–117 行）对 enabled 字段同样做 `and 0x01` 掩码；
    - `parseTouchConfig`（第 120–128 行）原样透传 5 字节，不做取值校验。
