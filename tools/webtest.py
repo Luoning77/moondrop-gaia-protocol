@@ -1148,6 +1148,17 @@ def read_state():
             "steps": steps,
         }
 
+    # 逐项读取时加「连续无接收」守卫。
+    #
+    # 判据是 rx_raw is None —— 这一项连一个字节都没收到，而不是「没匹配上」。
+    # 设备回错误帧、回无关帧都算有接收，不会触发提前退出；只有链路真的没反应
+    # 才退出。没有这个守卫时，链路只推送通知或读到一半断连，会逐项等满各自
+    # 的超时（最坏约 17s），页面一直转圈。
+    #
+    # 注意 STATE_READS 里每一项都必须是真机上有回帧的命令：如果连续两项都不支持，
+    # 这里会误判断连。当前 12 项均已验证（LC3/LDAC 回的是错误帧，不是无回帧）。
+    empty_streak = 0
+    aborted_early = False
     for key, feature, cmd, payload, timeout, retries, label in STATE_READS:
         if key in by_key:
             # 兜底探活时已经读过电量，不要重复发。
@@ -1156,6 +1167,13 @@ def read_state():
         result["label"] = label
         steps.append(result)
         by_key[key] = result
+        if result.get("rx_raw"):
+            empty_streak = 0
+        else:
+            empty_streak += 1
+            if empty_streak >= 2:
+                aborted_early = True
+                break
 
     state = {}
 
@@ -1227,6 +1245,8 @@ def read_state():
     return {
         "online": online,
         "answered": answered,
+        # 因连续两项零接收而提前结束：调用方可据此提示「链路中断，状态不完整」。
+        "aborted_early": aborted_early,
         "demo": isinstance(ser, MockSerial),
         "port": getattr(ser, "port", None),
         "state": state,

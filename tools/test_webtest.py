@@ -967,3 +967,76 @@ def test_issue6_api_status_online_requires_connected(monkeypatch):
         "必须与 connected 取与。对应评审第 6 条。"
     )
 
+
+def test_issue6_read_state_aborts_on_dead_link(monkeypatch):
+    """读到一半链路断掉时，不能逐项等满所有超时。
+
+    构造：前两项（探活 + 电量兜底）正常应答，之后全部零接收。
+    期望连续两项零接收后提前结束，steps 明显少于完整的 13 步。
+    """
+    _fast_read_state(monkeypatch)
+    call_count = {"n": 0}
+
+    def respond(feature, cmd, payload):
+        call_count["n"] += 1
+        # 前两次请求正常应答（固件探活 + 电量），之后链路静默
+        if call_count["n"] <= 2:
+            if (feature, cmd) == (0x00, 0x05):
+                return _response(0x00, 0x05, b"3.5.6")
+            if (feature, cmd) == (0x1A, 0x01):
+                return _response(0x1A, 0x01, bytes([1, 82, 2, 79, 3, 0xFF]))
+        return b""
+
+    _install(FakeSerial(respond))
+    result = webtest.read_state()
+
+    assert result["aborted_early"] is True, (
+        "期望连续两项零接收时提前结束并标记 aborted_early=True，"
+        f"实际 aborted_early={result.get('aborted_early')!r}、"
+        f"steps={len(result['steps'])} 条。没有守卫时会跑满 12 项各自超时。"
+    )
+    assert len(result["steps"]) <= 5, (
+        f"期望提前结束后 steps 明显少于完整读取，实际发了 {len(result['steps'])} 条。"
+    )
+    assert result["state"].get("firmware") == "3.5.6", (
+        f"期望链路断开前已读到的值仍保留，实际 state={result['state']!r}。"
+    )
+
+
+def test_issue6_read_state_does_not_abort_on_device_errors(monkeypatch):
+    """设备回错误帧不算零接收，不能触发提前结束。
+
+    真机上 LC3/LDAC 会回「不支持的命令」错误帧；这类响应证明链路正常，
+    守卫必须继续读完，否则会漏读后面的项。
+    """
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        (0x00, 0x05): _response(0x00, 0x05, b"3.5.6"),
+        (0x1A, 0x01): _response(0x1A, 0x01, bytes([1, 82, 2, 79, 3, 0xFF])),
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),
+        (0x40, 0x29): _response(0x40, 0x29, bytes([1, 1, 1, 1, 0])),
+        (0x1E, 0x01): _response(0x1E, 0x01, bytes([1])),
+        (0x26, 0x01): _response(0x26, 0x01, bytes([1])),
+        (0x2C, 0x02): _response(0x2C, 0x02, bytes([0x11, 0x23, 0x77, 0x45, 0x66])),
+        (0x1C, 0x01): _response(0x1C, 0x01, bytes([1, 64, 1])),
+        (0x20, 0x05): _response(0x20, 0x05, bytes([0])),
+        # LC3 / LDAC 连续两条错误帧：不是零接收
+        (0x20, 0x01): _device_error(0x20, 0x01, 1),
+        (0x20, 0x02): _device_error(0x20, 0x02, 1),
+        (0x28, 0x01): _response(0x28, 0x01, bytes([1])),
+        (0x28, 0x03): _response(0x28, 0x03, bytes([5])),
+    }))
+    result = webtest.read_state()
+
+    assert result["aborted_early"] is False, (
+        "期望设备回错误帧时不触发提前结束（错误帧证明链路正常），"
+        f"实际 aborted_early={result['aborted_early']!r}、steps={len(result['steps'])} 条。"
+    )
+    assert len(result["steps"]) == 13, (
+        f"期望读完全部 13 步，实际 {len(result['steps'])} 条（提前退出了）。"
+    )
+    assert result["state"].get("onebringtwo") == 1, (
+        "期望错误帧之后的项仍然读到（onebringtwo 在 LC3/LDAC 之后），"
+        f"实际 state={result['state']!r}。"
+    )
+
