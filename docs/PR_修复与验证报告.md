@@ -14,6 +14,8 @@
 
 5 条意见全部采纳并修复，无「不采纳」项。本报告中的每一条结论都可追溯到具体提交、命令输出或测试用例名；凡未实际执行的检查，均在第 5 节如实标注。真机验证已在 MOONDROP Pudding（固件 `3.5.6`）上完成主要场景，结果见第 4 节，其中包含两处与 DEMO 假设不一致的真机行为。
 
+第二轮复审（针对 `3fa7ab9`）确认上述 5 项已完成，同时指出同一类缺陷在读取路径仍有残留：多个入口以「解出了一帧」为成功或在线依据。该问题（记作问题 6）已在本报告 6.1 节记录，修复提交 `b531a95`，并补充了 10 条回归测试。
+
 ---
 
 ## 1. 修复对应关系
@@ -60,14 +62,14 @@
 | 项目 | 内容 |
 |---|---|
 | 命令 | `python -m pytest tools\test_webtest.py -q`（仓库根目录） |
-| 结果 | **20 passed**，耗时 3.11 s（本次写作时复跑 3.12 s / 3.13 s） |
+| 结果 | **30 passed**，耗时 9.96 s（第一轮修复后为 20 个用例、约 3.1 s；第二轮补齐读取路径判据后增至 30 个） |
 | 修复前基线 | **16 failed / 4 passed**（同一测试文件在评审基线 `0a3c868` 的 `webtest.py` 上运行，约 4～5 s） |
 | 编译检查 | `python -m py_compile tools\webtest.py` → exit 0 |
 | Python | 3.14.2 |
 | pytest | 9.1.1 |
 | pyserial | 3.5 |
 | 平台 | Windows 10 专业版（10.0.19045） |
-| 测试文件 | `tools/test_webtest.py`，730 行，20 个用例 |
+| 测试文件 | `tools/test_webtest.py`，870 行，30 个用例 |
 
 测试不依赖真实蓝牙：用实现了 pyserial 子集的 `FakeSerial`（`in_waiting` / `read` / `write` / `flush` / `reset_input_buffer` / `is_open` / `port`）注入应答，因此重试次数、坏帧重同步等断言都来自「实际 write 次数」和「注入字节序列」，不靠 sleep 计时。所有重试相关用例的 `timeout` 取 0.12～0.2 s，全套 20 个用例约 3.1 s 完成。
 
@@ -75,32 +77,42 @@
 
 ```
 $ python -m pytest tools\test_webtest.py -q
-....................                                                     [100%]
-20 passed in 3.11s
+..............................                                           [100%]
+30 passed in 9.96s
 ```
 
 ```
 $ python -m pytest tools\test_webtest.py -v
-tools/test_webtest.py::test_issue1_error_frame_not_success PASSED        [  5%]
-tools/test_webtest.py::test_issue1_unmatched_frame_not_success PASSED    [ 10%]
-tools/test_webtest.py::test_issue2_notification_does_not_stop_retry PASSED [ 15%]
-tools/test_webtest.py::test_issue2_matched_error_frame_counts_as_matched PASSED [ 20%]
-tools/test_webtest.py::test_issue2_keeps_all_received_frames PASSED      [ 25%]
-tools/test_webtest.py::test_issue3_set_rejected_but_state_already_expected PASSED [ 30%]
-tools/test_webtest.py::test_issue3_touch_rejected_but_state_already_expected PASSED [ 35%]
-tools/test_webtest.py::test_issue3_tone_rejected_but_state_already_expected PASSED [ 40%]
-tools/test_webtest.py::test_issue3_set_noack_still_ok PASSED             [ 45%]
-tools/test_webtest.py::test_issue5_bad_len_resync PASSED                 [ 50%]
-tools/test_webtest.py::test_issue5_bad_len_resync_recv_frame PASSED      [ 55%]
-tools/test_webtest.py::test_issue5_split_and_coalesced PASSED            [ 60%]
-tools/test_webtest.py::test_decode_packet_oversized_len PASSED           [ 65%]
-tools/test_webtest.py::test_decode_packet_accepts_max_len PASSED         [ 70%]
-tools/test_webtest.py::test_issue5_bad_vendor_resync PASSED              [ 75%]
-tools/test_webtest.py::test_issue5_len_513_resync PASSED                 [ 80%]
-tools/test_webtest.py::test_issue5_cross_frame_swallow PASSED            [ 85%]
-tools/test_webtest.py::test_issue2_retry_does_not_clear_valid_carry PASSED [ 90%]
-tools/test_webtest.py::test_issue5_mockserial_bad_len PASSED             [ 95%]
-tools/test_webtest.py::test_issue4_python_summary_unknown_codec PASSED   [100%]
+tools/test_webtest.py::test_issue1_error_frame_not_success PASSED
+tools/test_webtest.py::test_issue1_unmatched_frame_not_success PASSED
+tools/test_webtest.py::test_issue2_notification_does_not_stop_retry PASSED
+tools/test_webtest.py::test_issue2_matched_error_frame_counts_as_matched PASSED
+tools/test_webtest.py::test_issue2_keeps_all_received_frames PASSED
+tools/test_webtest.py::test_issue3_set_rejected_but_state_already_expected PASSED
+tools/test_webtest.py::test_issue3_touch_rejected_but_state_already_expected PASSED
+tools/test_webtest.py::test_issue3_tone_rejected_but_state_already_expected PASSED
+tools/test_webtest.py::test_issue3_set_noack_still_ok PASSED
+tools/test_webtest.py::test_issue5_bad_len_resync PASSED
+tools/test_webtest.py::test_issue5_bad_len_resync_recv_frame PASSED
+tools/test_webtest.py::test_issue5_split_and_coalesced PASSED
+tools/test_webtest.py::test_decode_packet_oversized_len PASSED
+tools/test_webtest.py::test_decode_packet_accepts_max_len PASSED
+tools/test_webtest.py::test_issue5_bad_vendor_resync PASSED
+tools/test_webtest.py::test_issue5_len_513_resync PASSED
+tools/test_webtest.py::test_issue5_cross_frame_swallow PASSED
+tools/test_webtest.py::test_issue2_retry_does_not_clear_valid_carry PASSED
+tools/test_webtest.py::test_issue5_mockserial_bad_len PASSED
+tools/test_webtest.py::test_issue4_python_summary_unknown_codec PASSED
+tools/test_webtest.py::test_issue6_read_state_error_frame_means_online PASSED
+tools/test_webtest.py::test_issue6_read_state_no_reply_is_offline PASSED
+tools/test_webtest.py::test_issue6_read_state_notification_is_not_online PASSED
+tools/test_webtest.py::test_issue6_api_check_reports_answered_separately PASSED
+tools/test_webtest.py::test_issue6_battery_error_frame_not_success PASSED
+tools/test_webtest.py::test_issue6_mark_online_requires_device_answer PASSED
+tools/test_webtest.py::test_issue6_firmware_requires_matched PASSED
+tools/test_webtest.py::test_issue6_probe_ladder_falls_back_to_battery PASSED
+tools/test_webtest.py::test_issue6_firmware_matched_response_still_works PASSED
+tools/test_webtest.py::test_issue6_api_status_online_requires_connected PASSED
 ```
 
 用例与评审编号的对应：
@@ -112,6 +124,7 @@ tools/test_webtest.py::test_issue4_python_summary_unknown_codec PASSED   [100%]
 | 3 | `test_issue3_set_rejected_but_state_already_expected`、`test_issue3_touch_rejected_but_state_already_expected`、`test_issue3_tone_rejected_but_state_already_expected`、`test_issue3_set_noack_still_ok` |
 | 4 | `test_issue4_python_summary_unknown_codec`（Python 侧镜像防护，Kotlin 侧见 2.2） |
 | 5 | `test_issue5_bad_len_resync`、`test_issue5_bad_len_resync_recv_frame`、`test_issue5_split_and_coalesced`、`test_decode_packet_oversized_len`、`test_decode_packet_accepts_max_len`、`test_issue5_bad_vendor_resync`、`test_issue5_len_513_resync`、`test_issue5_cross_frame_swallow`、`test_issue5_mockserial_bad_len` |
+| 6 | 其余 10 条 `test_issue6_*`，逐条对应关系见 6.1 节 |
 
 **红阶段（修复前）基线**：把测试文件放到评审当时的提交 `0a3c868` 的 `tools/webtest.py` 上运行（仓库外临时目录，不改仓库文件），得到 `16 failed, 4 passed in 4.87s`。4 个通过项均为有意设置的「回归基准」，不是问题复现不出来：`test_issue2_matched_error_frame_counts_as_matched`、`test_issue3_set_noack_still_ok`、`test_issue5_split_and_coalesced`、`test_decode_packet_accepts_max_len`。代表性失败输出：
 
@@ -393,6 +406,49 @@ systemProp.https.proxyPort=7890
 | A6 | `_summarize()` 把编解码域任意非零值都显示为「开」，与问题 4 的三态语义不一致 | 改为 `0x00 → 关`、`0x01 → 开`、其余 → `未知(0xNN)` | `webtest.py` 第 179–190 行 | `test_issue4_python_summary_unknown_codec` |
 
 另外，问题 5 的修复过程中还顺带修正了两处（已并入第 1 节问题 5 描述，不重复计数）：`decode_packet()` 的 Len 上限检查顺序（必须在「长度不足」判断之前），以及 Vendor 校验必须先于长度校验（否则 Len 刚好凑够时会把后续合法帧吞进 payload）。
+
+### 6.1 第二轮评审指出的遗留项（问题 6）
+
+第二轮复审在 `3fa7ab9` 上确认前 5 项已完成，同时指出同一类缺陷仍残留在读取路径：把「解出了一帧」当成「设备应答了本次请求」，据此判定成功或在线。修复提交 `b531a95`。
+
+| 编号 | 位置 | 问题 | 处理 |
+|---|---|---|---|
+| B1 | `read_state()` 最终 `online` | `any(decoded is not None)` 把无关通知帧也算作在线证据 | 改为 `any(_step_answered(step))`：`_step_answered()` 只认 `response`/`error` 帧，通知不算 |
+| B2 | `_mark_online()` | 同上，写路径因收到通知而误标在线 | 同样改用 `_step_answered()` |
+| B3 | `/api/check` | 只返回 `online`，「设备拒绝」与「设备离线」无法区分 | 改为分别返回 `connected` / `online` / `answered` / `status` / `error_name` |
+| B4 | `/api/status` | `device_online` 是全局值，串口关闭后仍报 `online=true` | `online = connected and device_online` |
+| B5 | 前端 `refreshBattery()` | 只判 `step.decoded`，设备拒绝时仍提示「电量已刷新」而值未更新 | 改为 `data.ok && decoded.battery`，失败走 `replyFailureText()` 给出具体原因 |
+| B6 | 前端 `reloadTouch()` / `loadTouchDefaults()` | 只判 `frame_type === 'response' && len >= 5`；设备回一条其它命令的 5 字节响应（如 `40 29` ANC 切换配置）时，会把 `[1,1,1,1,0]` 当成手势填入编辑器，用户再点写入就写进设备 | 改为要求 `data.ok` |
+| B7 | `read_state()` 固件赋值 | 只判 `frame_type == 'response'`，未校验 `matched`；请求 `00 05` 却收到 `00 03`（设备序列号）时，序列号被当成固件版本显示 | 改用 `_payload_of()`（已过滤 error/notification/matched=False） |
+| B8 | `read_state()` 探活 | 把「`00 05` 无回帧」直接当成「设备不在」。真机上 `00 00`、`00 03` 本就无回帧，说明无回帧≠离线 | 改为两级探活：`00 05` 无应答后再试 `1A 01`（电量，面板本来就要读），任一有应答即判在线并继续读取 |
+
+覆盖测试（新增 10 个，总数 20 → 30）：
+
+| 用例 | 断言要点 |
+|---|---|
+| `test_issue6_read_state_error_frame_means_online` | 探活命中错误帧时 `online=True` 且继续读取其余项 |
+| `test_issue6_read_state_no_reply_is_offline` | 两条探活都无应答 → `online=False`、`state={}`、只发 2 条命令 |
+| `test_issue6_read_state_notification_is_not_online` | 只收到通知帧 → `online=False` |
+| `test_issue6_api_check_reports_answered_separately` | `online=True` / `answered=False` / `status=device_error` / 带 `error_name` |
+| `test_issue6_battery_error_frame_not_success` | 电量查询被拒时前端判据为假 |
+| `test_issue6_mark_online_requires_device_answer` | 通知不算在线、错误帧算在线 |
+| `test_issue6_firmware_requires_matched` | `matched=False` 的帧不得写入 `state.firmware` |
+| `test_issue6_probe_ladder_falls_back_to_battery` | 固件无回帧但电量有应答 → 判在线且 `state` 非空 |
+| `test_issue6_firmware_matched_response_still_works` | 回归基准：正常匹配时固件仍能读出 |
+| `test_issue6_api_status_online_requires_connected` | 串口关闭时 `online=False`（不受陈旧 `device_online` 影响） |
+
+红绿验证：临时回退 B1/B7/B8 后，`test_issue6_read_state_notification_is_not_online`、`test_issue6_firmware_requires_matched`、`test_issue6_probe_ladder_falls_back_to_battery` 三条失败；恢复后 30 条全绿。
+
+真机验证（Pudding，固件 3.5.6，COM8）：`read_state` 返回 11 项、`firmware=3.5.6`、`online=True`、`answered=True`；`/api/status` 与 `/api/check` 的 `connected`/`online`/`answered` 均正确；设备拒绝命令时 `answered=False` 但 `online` 保持为真；单独发 `00 05` 仍 `ok=True`（加固未影响正常路径）；手势读取 `ok=True` 且 payload 5 字节。DEMO 三种模式（`--demo`、`--demo-noack`、`--demo-latency 0.1`）回归正常。
+
+`python -m pytest tools\test_webtest.py -q` → **30 passed in 9.96s**。
+
+### 6.2 本轮未处理、已知但影响有限的项
+
+| 项 | 现状 | 影响 | 建议 |
+|---|---|---|---|
+| `read_state()` 只收到通知帧时会跑满 12 项 | 每项等各自的 timeout，最坏约 17s | 面板在这种异常链路上会卡一阵，但不产生错误数据 | 可加守卫：连续 2 步无 RX 早退，或 `未 answered && elapsed > 4s` 早退 |
+| `probe_status` 里的 `unparsed` 分支 | `_take_frame` 已校验 vendor/len，裸 PDU 也保证 ≥4 字节可解，实际不可达 | 无 | 保留作为防御，不必为它写测试；但不要因此回退到用 `decoded` 判据 |
 
 ---
 
