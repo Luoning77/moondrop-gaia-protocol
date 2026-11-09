@@ -77,11 +77,25 @@ object ResponseParser {
     fun parseLhdcStatus(packet: GaiaPacket): Boolean? =
         parseCodecSwitch(packet, GaiaConstants.CMD_LHDC_STATUS)
 
+    /**
+     * 解析编解码开关状态（LDAC / LC3 / LHDC 三个入口共用）。
+     *
+     * 取值约定：payload[0] 中 `0x00` = false（关闭），`0x01` = true（开启），
+     * **其余任何值（如 0x02、0xFF）= null（无法识别）**。
+     *
+     * 与官方 APK `V3CodecPlugin.publishLc3State/publishLdacState/publishLhdcState`
+     * 中的 `bArr[0] == 1` 有意不同：APK 的写法会把设备返回的未定义值静默判为"关闭"，
+     * 本实现返回 null，用于区分"确实关闭"与"无法识别"，避免向 UI 上报错误的关闭状态。
+     */
     private fun parseCodecSwitch(packet: GaiaPacket, commandId: Int): Boolean? {
         if (packet.featureId != (GaiaConstants.FEATURE_CODEC or GaiaConstants.RESPONSE_BIT)) return null
         if (packet.commandId != commandId) return null
         if (packet.payload.isEmpty()) return null
-        return packet.payload[0] == 0x01.toByte()
+        return when (packet.payload[0].toInt() and 0xFF) {
+            0x00 -> false
+            0x01 -> true
+            else -> null // 0x02/0xFF 等：设备未定义，不猜
+        }
     }
 
     /** 解析指示灯状态 (Feature=0x27, Cmd=0x01/0x02) */

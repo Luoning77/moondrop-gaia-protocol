@@ -301,6 +301,64 @@ class GaiaCodecTest {
     }
 
     @Test
+    fun `parse codec switch 0x00 is false and 0x01 is true`() {
+        // 评审第 4 条：0x00 / 0x01 两个合法值必须分别映射为 false / true。
+        // assertEquals(false, ...) 与 assertEquals(true, ...) 同时排除了 null 的情况。
+        assertEquals(false, ResponseParser.parseLc3Status(GaiaPacket(0x21, 0x01, hex(0x00))))
+        assertEquals(true, ResponseParser.parseLc3Status(GaiaPacket(0x21, 0x01, hex(0x01))))
+
+        // LDAC / LHDC 的 0x00 / 0x01 同样要正确映射
+        assertEquals(false, ResponseParser.parseLdacStatus(GaiaPacket(0x21, 0x02, hex(0x00))))
+        assertEquals(true, ResponseParser.parseLdacStatus(GaiaPacket(0x21, 0x02, hex(0x01))))
+        assertEquals(false, ResponseParser.parseLhdcStatus(GaiaPacket(0x21, 0x05, hex(0x00))))
+        assertEquals(true, ResponseParser.parseLhdcStatus(GaiaPacket(0x21, 0x05, hex(0x01))))
+    }
+
+    @Test
+    fun `parse codec switch unknown value 0x02 returns null`() {
+        // 独立断言 0x02：不能和 0xFF 合并，否则只处理一个分支的 bug 会漏测
+        assertNull(ResponseParser.parseLc3Status(GaiaPacket(0x21, 0x01, hex(0x02))))
+    }
+
+    @Test
+    fun `parse codec switch unknown value 0xff on lc3 returns null`() {
+        assertNull(ResponseParser.parseLc3Status(GaiaPacket(0x21, 0x01, hex(0xFF))))
+    }
+
+    @Test
+    fun `parse codec switch unknown value 0xff on ldac returns null`() {
+        assertNull(ResponseParser.parseLdacStatus(GaiaPacket(0x21, 0x02, hex(0xFF))))
+    }
+
+    @Test
+    fun `parse codec switch unknown value 0xff on lhdc returns null`() {
+        assertNull(ResponseParser.parseLhdcStatus(GaiaPacket(0x21, 0x05, hex(0xFF))))
+    }
+
+    @Test
+    fun `parse codec switch on error frame returns null`() {
+        // 响应 Feature + Cmd 错误位（0x01|0x80 / 0x02|0x80 / 0x05|0x80）
+        assertNull(ResponseParser.parseLc3Status(GaiaPacket(0x21, 0x81, hex(0x01))))
+        assertNull(ResponseParser.parseLdacStatus(GaiaPacket(0x21, 0x82, hex(0x01))))
+        assertNull(ResponseParser.parseLhdcStatus(GaiaPacket(0x21, 0x85, hex(0x01))))
+    }
+
+    @Test
+    fun `parse codec switch on notification returns null`() {
+        // Feature 无响应位（0x20）+ Cmd 带错误位
+        assertNull(ResponseParser.parseLc3Status(GaiaPacket(0x20, 0x81, hex(0x01))))
+        // Feature 无响应位（0x20）+ 正常 Cmd，通知帧也不是查询响应
+        assertNull(ResponseParser.parseLc3Status(GaiaPacket(0x20, 0x01, hex(0x01))))
+    }
+
+    @Test
+    fun `parse codec switch empty payload returns null`() {
+        assertNull(ResponseParser.parseLc3Status(GaiaPacket(0x21, 0x01)))
+        assertNull(ResponseParser.parseLdacStatus(GaiaPacket(0x21, 0x02, byteArrayOf())))
+        assertNull(ResponseParser.parseLhdcStatus(GaiaPacket(0x21, 0x05, ByteArray(0))))
+    }
+
+    @Test
     fun `error and success use protocol bits`() {
         val error = GaiaPacket(0x41, 0x84, byteArrayOf(0x06))
         assertTrue(ResponseParser.isError(error))
