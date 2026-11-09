@@ -60,8 +60,8 @@
 | 项目 | 内容 |
 |---|---|
 | 命令 | `python -m pytest tools\test_webtest.py -q`（仓库根目录） |
-| 结果 | **20 passed**，耗时 3.11 s（本次复跑 3.12 s / 3.13 s） |
-| 修复前基线 | **16 failed / 4 passed**（约 4 s） |
+| 结果 | **20 passed**，耗时 3.11 s（本次写作时复跑 3.12 s / 3.13 s） |
+| 修复前基线 | **16 failed / 4 passed**（同一测试文件在评审基线 `0a3c868` 的 `webtest.py` 上运行，约 4～5 s） |
 | 编译检查 | `python -m py_compile tools\webtest.py` → exit 0 |
 | Python | 3.14.2 |
 | pytest | 9.1.1 |
@@ -113,7 +113,7 @@ tools/test_webtest.py::test_issue4_python_summary_unknown_codec PASSED   [100%]
 | 4 | `test_issue4_python_summary_unknown_codec`（Python 侧镜像防护，Kotlin 侧见 2.2） |
 | 5 | `test_issue5_bad_len_resync`、`test_issue5_bad_len_resync_recv_frame`、`test_issue5_split_and_coalesced`、`test_decode_packet_oversized_len`、`test_decode_packet_accepts_max_len`、`test_issue5_bad_vendor_resync`、`test_issue5_len_513_resync`、`test_issue5_cross_frame_swallow`、`test_issue5_mockserial_bad_len` |
 
-**红阶段（修复前）基线**：把测试文件放到未修复的 `tools/webtest.py`（提交 `692c990` 版本）上运行，得到 `16 failed, 4 passed in 4.51s`。4 个通过项均为有意设置的「回归基准」，不是问题复现不出来：`test_issue2_matched_error_frame_counts_as_matched`、`test_issue3_set_noack_still_ok`、`test_issue5_split_and_coalesced`、`test_decode_packet_accepts_max_len`。代表性失败输出：
+**红阶段（修复前）基线**：把测试文件放到评审当时的提交 `0a3c868` 的 `tools/webtest.py` 上运行（仓库外临时目录，不改仓库文件），得到 `16 failed, 4 passed in 4.87s`。4 个通过项均为有意设置的「回归基准」，不是问题复现不出来：`test_issue2_matched_error_frame_counts_as_matched`、`test_issue3_set_noack_still_ok`、`test_issue5_split_and_coalesced`、`test_decode_packet_accepts_max_len`。代表性失败输出：
 
 - 问题 1：`AssertionError: ... decoded.frame_type=error、decoded.payload=[5]，前端现有条件 step && !step.error && step.decoded = True，会弹出「命令已发送」`
 - 问题 2：`AssertionError: 期望重试真的发生（初始 1 次 + 重试 1 次 = 2 次 write），实际 write 次数=1；matched=False，最后一次解码 frame_type='notification'`
@@ -209,6 +209,18 @@ python tools/webtest.py --demo --demo-latency 0.1 --web-port 18095
 
 DEMO 的假设备是简化模型（`MockSerial`，`tools/webtest.py` 第 284 行起），其应答逻辑与真实固件不完全等价；表中「实测」只代表本仓库假设备与本地 Web API 链路的行为，不构成真机结论，见第 4 节。
 
+评审要求覆盖的四类场景（成功 / 设备拒绝 / 超时 / 通知抢先到达）分别落到哪里，如实说明如下：
+
+| 评审要求的场景 | 验证方式 | 说明 |
+|---|---|---|
+| 成功 | DEMO 实测 | 上表 `--demo`、`--demo-noack`、`--demo-latency` 各行的 ok=true 项 |
+| 设备拒绝 | DEMO 实测 | 上表 `F=0x40 C=0x7F` 各行，返回 `status=device_error`、`error_name="不支持的命令 (1)"` |
+| 超时 | DEMO 实测（仅 SET 无 ACK 一种） | `--demo-noack` 下 `/api/set/anc?mode=3` 的 SET 步骤 status=timeout、matched=False；`MockSerial` 对已知命令都会应答、对未知命令回错误帧，因此 DEMO 模式下无法构造「读命令完全无响应」的超时 |
+| 通知抢先到达 | **仅单元测试，未在 DEMO 中复现** | `MockSerial` 不会在响应前主动插播异步通知，DEMO 模式下无法构造该时序。该场景由 `test_issue2_notification_does_not_stop_retry`（先回无关通知、第二次 write 才回目标响应，断言 write 次数=2 且 matched=True）与 `test_issue2_keeps_all_received_frames`（断言通知帧与响应帧都保留在 `frames`）覆盖 |
+| 无匹配响应（`status=unmatched`） | **仅单元测试，未在 DEMO 中复现** | `MockSerial` 对未知命令回「不支持的特性/命令」错误帧（属于 `device_error`），对已知命令总回匹配帧，因此 DEMO 下拿不到 `unmatched`。实测传 `feature=0x41`（响应位 Feature）会被当作未知请求回 `status=timeout`，也不是 `unmatched`。该状态由 `test_issue1_unmatched_frame_not_success` 覆盖 |
+
+即「通知抢先到达」与「无匹配响应」两类**没有 DEMO 级证据**，只有单元测试证据；如果复审要求 DEMO 级别的复现，需要给 `MockSerial` 增加「响应前先插播通知」和「回无关响应帧」的可编程开关——本轮未做，因为那属于修改 DEMO 假设备的行为，超出了本次修复的范围。
+
 ---
 
 ## 4. 真机验证状态
@@ -251,7 +263,7 @@ systemProp.https.proxyPort=7890
 | 同上，但 `--no-daemon` | 同样为 `7897`，排除 daemon 缓存旧值的干扰 |
 | cmd.exe 中未加引号传 `-Dhttps.proxyPort=7897` | 同样为 `7897`，覆盖成功 |
 
-即：`gradle.properties` 的 `systemProp.*` 与命令行 `-D` 同时存在时，**正确传参的 `-D` 优先**；之前的结论「压不过 `systemProp`」在实测中不成立，真正的障碍是 PowerShell 下参数被拆分导致构建在配置阶段就失败（`gradlew.bat` 不报参数错误，只报任务不存在，容易误判为代理问题）。
+结论（按实测修正）：在 PowerShell 里按常规写法传 `-D` 时，`systemProp.*` 实际生效，代理仍指向不可用的 7890，构建在配置阶段失败——从结果看确实「压不过」。但根因不是 Gradle 的优先级，而是 PowerShell 调用 `.bat` 时把 `-Dhttps.proxyPort=7897` 拆成了两个 token，Gradle 只收到残缺参数。换成加引号的写法（或在 cmd.exe 下）即可正常覆盖。由于这一写法差异对使用者不直观、且 `gradlew.bat` 的报错（`Task '.proxyPort=7897' not found`）指向任务名而非参数，实际使用中仍建议按「`--offline` 或临时改 `gradle.properties`」处理。
 
 本次验证的规避方式：**不改仓库配置**，使用 `--offline` 配合已缓存的依赖完成构建（`~/.gradle/wrapper/dists/gradle-9.4.1-bin` 已存在，`gradle-9.4.1-bin.zip.ok` 标记完整；首次构建需下载 130MB 发行包，本次未触发下载）。若需要在干净环境联网构建，可选任一方式：临时修改 `gradle.properties` 的代理端口；或用 PowerShell 加引号的 `-Dhttps.proxyHost=127.0.0.1 '-Dhttps.proxyPort=7897'`（注意 http/https 两组都要传，实测只传 https 时 `http.proxyPort` 仍为 7890）。该环境问题不随 PR 修改 `gradle.properties`，避免把个人代理配置带入仓库。
 
