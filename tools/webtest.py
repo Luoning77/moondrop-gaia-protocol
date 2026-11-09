@@ -17,6 +17,12 @@ import serial
 
 VENDOR_ID = 0x001D
 
+# 单帧 payload 上限，与 Kotlin 侧 GaiaCodec.MAX_PAYLOAD 对齐。
+# 协议文档没有规定这个上限，512 是本仓库自选的阈值：超过它基本只能是 Len 字段
+# 已经损坏（例如帧头被噪声污染成 FF 04 FF FF），此时按错帧丢弃并重新同步，
+# 而不是按一个不可信的长度一直等、把所有后续正常帧都卡死。
+MAX_PAYLOAD = 512
+
 # 帧里的 Feature 字节 = feature_id << 1（低 bit 为响应标志）
 FEATURE_NAMES = {
     0x00: "基础查询",
@@ -173,9 +179,15 @@ def _summarize(d):
     if base_feature == 0x20:
         names = {0x01: "LC3", 0x02: "LDAC", 0x05: "LHDC", 0x03: "LC3", 0x04: "LDAC", 0x06: "LHDC"}
         label = names.get(cmd, f"C:0x{cmd:02X}")
-        if payload:
-            return f"{label}: {'开' if payload[0] else '关'}"
-        return f"{label}: (空)"
+        if not payload:
+            return f"{label}: (空)"
+        if cmd in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06):
+            # 三态：0x00=关、0x01=开、其余=未知。与 Kotlin parseCodecSwitch 的语义对齐，
+            # 不能再用 `if payload[0]` 把 0x02/0xFF 之类的未定义值显示成「开」。
+            value = payload[0] & 0xFF
+            state = {0x00: "关", 0x01: "开"}.get(value, f"未知(0x{value:02X})")
+            return f"{label}: {state}"
+        return f"{label}: {_hex_bytes(payload)}"
 
     if base_feature == 0x2C:
         if len(payload) >= 5:
@@ -224,9 +236,13 @@ def decode_packet(data):
     data = bytes(data)
     if len(data) >= 8 and data[0] == 0xFF and data[1] == 0x04:
         length = (data[2] << 8) | data[3]
+        # 上限检查必须放在「长度不够」之前：Len 损坏成 0xFFFF 时缓冲区永远凑不够，
+        # 否则会被当成「数据未到齐」而不是「帧头损坏」。Len 恰好等于上限仍合法。
+        if length > MAX_PAYLOAD:
+            return None
         if len(data) < 8 + length:
             return None
-        if data[5] != 0x1D:
+        if data[5] != (VENDOR_ID & 0xFF):
             return None
         f, c = data[6], data[7]
         payload = list(data[8:8 + length])
@@ -324,20 +340,24 @@ class MockSerial:
     def write(self, data):
         raw = bytes(data)
         # 拼接上次遗留的半帧，支持一个帧被拆成多次写入。
-        data = bytes(self._pending) + raw
+        buf = bytearray(self._pending) + bytearray(raw)
         self._pending = bytearray()
         replies = bytearray()
         try:
-            rest = data
-            while len(rest) >= 8:
-                length = (rest[2] << 8) | rest[3]
-                total = 8 + length
-                if len(rest) < total:
+            while buf:
+                frame, rest, status = _take_frame_ex(buf)
+                if status == FRAME_OK:
+                    replies += self._handle(frame)
+                    buf = rest
+                    continue
+                if status == FRAME_WAIT:
+                    # 头没到齐（<8 字节）或长度合法但这一批没写全：保留半帧等下次 write。
                     break
-                replies += self._handle(rest[:total])
-                rest = rest[total:]
-            if rest:
-                self._pending = bytearray(rest)
+                # FRAME_BAD（帧头非法 / Vendor 错 / Len 超限）：丢 1 字节重新同步，
+                # 避免一个坏 Len 把 _pending 永久污染，导致之后所有命令都写不进来。
+                del buf[:1]
+            if buf:
+                self._pending = bytearray(buf)
         except Exception:
             replies = bytearray()
             self._pending = bytearray()
@@ -372,7 +392,7 @@ class MockSerial:
     def _handle(self, pkt):
         if len(pkt) < 8 or pkt[0] != 0xFF or pkt[1] != 0x04:
             return b""
-        if pkt[5] != 0x1D:
+        if pkt[5] != (VENDOR_ID & 0xFF):
             return b""
         length = (pkt[2] << 8) | pkt[3]
         if len(pkt) < 8 + length:
@@ -574,21 +594,137 @@ def _error_result(tx, message):
         "rx_raw": None,
         "decoded": None,
         "error": message,
+        "matched": False,
+        "frames": [],
+        "ok": False,
+        "status": "write_failed" if message.startswith("串口写入失败") else "no_link",
     }
 
 
 _rx_carry = bytearray()
 
+# _take_frame / MockSerial.write 共用的切帧判定结果。
+FRAME_OK = "ok"       # 取到一个校验通过的完整帧
+FRAME_WAIT = "wait"   # 头没到齐、或长度声明合法但数据未收全：保留字节等下一批
+FRAME_BAD = "bad"     # 帧头非法 / Vendor 错 / Len 超限：调用方应丢 1 字节重新同步
 
-def _take_frame(buf):
-    """从缓冲区头部取一个 FF 04 帧；返回 (frame, rest) 或 (None, buf)。"""
-    if len(buf) < 8 or not buf.startswith(b"\xFF\x04"):
-        return None, buf
+
+class FrameSlice:
+    """_take_frame 的返回值：兼容 `frame, rest = _take_frame(buf)` 两元解包。
+
+    本体按二元序列解包成 (frame, rest)，用 `.status` 读第三态
+    （FRAME_OK / FRAME_WAIT / FRAME_BAD）。这样既有调用点的两元解包写法不用改，
+    新逻辑也能拿到完整判定结果。
+    """
+
+    __slots__ = ("frame", "rest", "status")
+
+    def __init__(self, frame, rest, status):
+        self.frame = frame
+        self.rest = rest
+        self.status = status
+
+    def __iter__(self):
+        return iter((self.frame, self.rest))
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, index):
+        return (self.frame, self.rest)[index]
+
+    def __repr__(self):
+        return f"FrameSlice(frame={self.frame!r}, status={self.status!r})"
+
+
+def _holds_embedded_frame(buf, total):
+    """识别「Len 凑得够，于是把紧随其后的合法帧整段吞进 payload」这种切帧错误。
+
+    触发条件刻意收得很窄，只有同时满足才算坏帧：
+      1. payload 内部完整嵌着一个结构合法的帧（FF 04 + Vendor=0x1D + Len <= 上限且收全）；
+      2. 这个内嵌帧的结尾要么正好是本帧 payload 的结尾，要么紧接着又出现 FF 04 帧头。
+
+    条件 2 是「两个真实帧背靠背、外层 Len 被污染成更大的值」的专有特征。
+    只判断「payload 里出现过 FF 04」会误杀正常的大 payload（payload 里偶然含
+    FF 04 两字节很常见），所以这里不用那种宽松启发式。
+    """
+    limit = min(total, len(buf))
+    j = 8
+    while j + 8 <= limit:
+        if (buf[j] == 0xFF and buf[j + 1] == 0x04
+                and buf[j + 5] == (VENDOR_ID & 0xFF)):
+            body_len = (buf[j + 2] << 8) | buf[j + 3]
+            end = j + 8 + body_len
+            if body_len <= MAX_PAYLOAD and end <= limit:
+                if end == total:
+                    return True
+                if end + 1 < len(buf) and buf[end] == 0xFF and buf[end + 1] == 0x04:
+                    return True
+        j += 1
+    return False
+
+
+def _take_frame_ex(buf):
+    """从缓冲区头部取一个 FF 04 帧，返回 (frame, rest, status) 三态。
+
+    校验顺序与 Kotlin `StreamDecoder.drain()` 一致：帧头 → Vendor → Len 上限 → 收全。
+    status 语义：
+      FRAME_OK   取到完整且校验通过的帧，rest 是剩余字节
+      FRAME_WAIT 帧头对、长度合法，但字节还没到齐（保留全部字节，不清缓冲）
+      FRAME_BAD  帧头非法、Vendor 不对、Len 超限，或切出来的 payload 里含着整帧
+                 （跨帧吞并），调用方丢 1 字节后重试
+    """
+    if len(buf) < 8:
+        return None, buf, FRAME_WAIT
+    if buf[0] != 0xFF or buf[1] != 0x04:
+        return None, buf, FRAME_BAD
+    # Vendor 必须先校验：Len 字段本身可能刚好「凑得够」，只看长度会把后续合法帧当
+    # payload 吞掉，静默产出错误数据。
+    if buf[5] != (VENDOR_ID & 0xFF):
+        return None, buf, FRAME_BAD
     body_len = (buf[2] << 8) | buf[3]
+    if body_len > MAX_PAYLOAD:
+        return None, buf, FRAME_BAD
     total = 8 + body_len
     if len(buf) < total:
-        return None, buf
-    return bytes(buf[:total]), buf[total:]
+        return None, buf, FRAME_WAIT
+    if _holds_embedded_frame(buf, total):
+        # Len 刚好凑够、却把后面的合法帧吃进了 payload：判定为坏帧头，
+        # 丢 1 字节重新找帧边界，而不是静默产出错误数据。
+        return None, buf, FRAME_BAD
+    return bytes(buf[:total]), buf[total:], FRAME_OK
+
+
+def _take_frame(buf):
+    """从缓冲区头部取一个 FF 04 帧。
+
+    返回 FrameSlice(frame, rest, status)，同时支持 `frame, rest = ...` 解包。
+    帧头非法 / Vendor 错 / Len 超限时**就地**从传入的 bytearray 里逐字节丢 1，
+    重新同步到下一个可能的帧起点；因此返回的 rest 一定以新帧头开始或为空。
+    """
+    while True:
+        frame, rest, status = _take_frame_ex(buf)
+        if status != FRAME_BAD:
+            return FrameSlice(frame, rest, status)
+        # 每轮 len(buf) 严格递减 1，不会死循环。
+        del buf[:1]
+
+
+def _find_frame_start(buf, start=0):
+    """在 buf 里找第一个「长得像合法 FF 04 帧」的起点下标，找不到返回 -1。
+
+    只看帧头 + Vendor + Len 上限，不要求 payload 已经收全，
+    因此拆包时也能正确定位到真正的帧起点。
+    """
+    i = start
+    limit = len(buf) - 8
+    while i <= limit:
+        if buf[i] == 0xFF and buf[i + 1] == 0x04 and buf[i + 5] == (VENDOR_ID & 0xFF):
+            body_len = (buf[i + 2] << 8) | buf[i + 3]
+            if body_len <= MAX_PAYLOAD:
+                return i
+        i += 1
+    return -1
 
 
 def _recv_frame(timeout):
@@ -596,16 +732,62 @@ def _recv_frame(timeout):
 
     一次 read 可能带回多帧：只返回第一帧，剩余字节留在 _rx_carry，
     供 send_cmd 继续匹配，避免把同一批到达的真实响应丢掉。
+
+    坏帧处理采用 Kotlin `StreamDecoder.drain()` 的「逐字节丢 1」策略：帧头非法、
+    Vendor 错或 Len 超限时只丢 1 个字节再重新找帧头，不做 buf.find 跳跃 ——
+    跳跃式重写在「Len 能凑够」的场景会跳过真正的帧边界。
     """
     if not ser or not ser.is_open:
         return b""
     deadline = time.time() + max(0.05, timeout)
     buf = bytearray(_rx_carry)
     _rx_carry.clear()
-    frame, rest = _take_frame(buf)
-    if frame is not None:
+
+    def resync():
+        """把缓冲区开头的无效字节逐字节丢掉，直到能判出完整帧或半帧。
+
+        返回 True 表示 buf 头部已经是一个校验通过的完整帧。
+
+        这里刻意不用「跳到下一个 FF 04」的跳跃式重同步：坏 vendor 或坏 Len 的帧
+        本身就以 FF 04 开头，跳跃会落到同一个错误起点上。逐字节丢 1 才能走完
+        Kotlin `StreamDecoder.drain()` 的等价路径。
+        """
+        while True:
+            if buf.startswith(b"\x00\x1D"):
+                # 裸 PDU 没有长度字段，交给静默判断；但如果这一段里还有 FF 04，
+                # 说明它只是坏帧中间的片段（坏帧 payload 恰好含 00 1D），
+                # 不能整段当成裸 PDU 交付，要继续重同步。
+                if _find_frame_start(buf, 2) < 0:
+                    return False
+                del buf[:1]
+                continue
+            sliced = _take_frame_ex(buf)
+            if sliced[2] == FRAME_OK:
+                return True
+            if sliced[2] == FRAME_BAD:
+                del buf[:1]
+                continue
+            # FRAME_WAIT
+            if len(buf) >= 8:
+                return False
+            if not buf:
+                return False
+            if buf[0] not in (0xFF, 0x00):
+                del buf[:1]
+                continue
+            if buf[0] == 0xFF and len(buf) >= 2 and buf[1] != 0x04:
+                del buf[:1]
+                continue
+            if buf[0] == 0x00 and len(buf) >= 2 and buf[1] != (VENDOR_ID & 0xFF):
+                del buf[:1]
+                continue
+            return False
+
+    if resync():
+        frame, rest, _ = _take_frame_ex(buf)
         _rx_carry.extend(rest)
         return frame
+
     last_rx = 0.0
     while time.time() < deadline:
         try:
@@ -620,23 +802,12 @@ def _recv_frame(timeout):
             if chunk:
                 buf.extend(chunk)
                 last_rx = time.time()
-                # 丢掉帧头前的杂字节，但保留可能只到了一半的 FF / 00 1D 头。
-                if not (buf.startswith(b"\xFF\x04") or buf.startswith(b"\x00\x1D")) and len(buf) >= 2:
-                    candidates = [i for i in (buf.find(b"\xFF\x04"), buf.find(b"\x00\x1D")) if i >= 0]
-                    if candidates:
-                        del buf[:min(candidates)]
-                    elif buf[-1:] in (b"\xFF", b"\x00"):
-                        buf = buf[-1:]
-                    else:
-                        buf.clear()
-                if buf.startswith(b"\xFF\x04"):
-                    frame, rest = _take_frame(buf)
-                    if frame is not None:
-                        _rx_carry.extend(rest)
-                        return frame
-                elif buf.startswith(b"\x00\x1D") and len(buf) >= 4:
-                    if time.time() - last_rx >= 0.05:
-                        return bytes(buf)
+                if resync():
+                    frame, rest, _ = _take_frame_ex(buf)
+                    _rx_carry.extend(rest)
+                    return frame
+                if buf.startswith(b"\x00\x1D") and len(buf) >= 4 and time.time() - last_rx >= 0.05:
+                    return bytes(buf)
         else:
             if buf.startswith(b"\x00\x1D") and len(buf) >= 4 and time.time() - last_rx >= 0.05:
                 return bytes(buf)
@@ -647,6 +818,12 @@ def _recv_frame(timeout):
 
 
 def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
+    """发送一条命令并等待匹配响应。
+
+    重试语义（评审第 2 条）：只有「匹配到本次请求的响应/错误帧」才算有结果并结束；
+    无关通知帧既不结束重试，也不消耗 retries 上界。重发次数还有 retries 兜底，
+    所以不存在无限重发的风险。
+    """
     payload = _parse_hex(payload_hex)
     tx = build_tx(feature, cmd, payload)
     if ser is None or not ser.is_open:
@@ -657,13 +834,20 @@ def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
     last_rx = b""
     last_decoded = None
     matched = False
+    received = []            # 本次调用收到的全部帧（诊断用，含无关通知）
+    # 每次 send_cmd 开始时清一次 carry：carry 只用于「同一条命令内」跨多次
+    # _recv_frame 保留半帧/后续帧。跨请求残留会让上一条命令的多余帧被下一条
+    # 命令误判成自己的响应（典型：--demo-noack 下前一条读命令的 ACK 残留）。
+    # 重试时不清理，避免把本轮已有的合法帧丢掉（评审第 2 条附带缺陷）。
+    _rx_carry.clear()
     for attempt in range(retries + 1):
         with ser_lock:
             if ser is None or not ser.is_open:
                 return _error_result(tx, "串口未连接")
             try:
+                # 只清物理缓冲，不动 _rx_carry：carry 里可能是本次尝试前半段已经
+                # 收到、但还没交付的合法帧，重试时清掉等于重试反而加速丢帧。
                 ser.reset_input_buffer()
-                _rx_carry.clear()
                 ser.write(tx)
                 ser.flush()
             except Exception as exc:
@@ -678,33 +862,54 @@ def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
                     break
                 last_rx = frame
                 last_decoded = decode_packet(frame)
+                received.append(last_decoded if last_decoded is not None else
+                                {"raw": frame.hex(" ").upper(), "frame_type": "unknown"})
                 if (last_decoded
                         and last_decoded["feature"] == expected_feature
                         and last_decoded["cmd_base"] == expected_cmd
                         and last_decoded["frame_type"] in ("response", "error")):
+                    # 匹配到的响应帧和设备错误帧都算 matched：错误帧是一个确定的
+                    # 设备裁决，重试没有意义，也不该被当成「没收到响应」。
                     matched = True
                     break
-                # 通知或其他命令的响应：继续等到 deadline，找真正的响应。
+                # 无关通知/其他命令的响应：不结束重试，继续等本次真正的响应。
         if matched:
-            break
-        if last_rx:
             break
         if attempt < retries:
             time.sleep(0.08)
 
-    if not last_rx:
-        return _error_result(tx, "无响应")
     result = {
         "tx": decode_packet(tx),
         "tx_raw": tx.hex(" ").upper(),
-        "rx_raw": last_rx.hex(" ").upper(),
+        "rx_raw": last_rx.hex(" ").upper() if last_rx else None,
         "decoded": last_decoded,
         "matched": matched,
+        "frames": received,
     }
-    if last_decoded is None:
+    # 显式成功判定（评审第 1 条）：只有「匹配到响应帧且不是设备错误帧」才算成功。
+    # 前端不再靠「有 decoded 且无 error 键」猜成功，curl 也能直接看 ok/status。
+    error_name = _error_of(result)
+    if not last_rx:
+        result["error"] = "无响应"
+        result["status"] = "timeout"
+        result["ok"] = False
+    elif last_decoded is None:
         result["warning"] = "收到无法解析的帧"
+        if error_name:
+            result["error_name"] = error_name
+        result["status"] = "unparsed"
+        result["ok"] = False
+    elif error_name:
+        result["error_name"] = error_name
+        result["status"] = "device_error"
+        result["ok"] = False
     elif not matched:
         result["warning"] = "未收到匹配的响应帧"
+        result["status"] = "unmatched"
+        result["ok"] = False
+    else:
+        result["status"] = "ok"
+        result["ok"] = True
     return result
 
 
@@ -718,7 +923,16 @@ def _payload_of(result):
 
 
 def _error_of(result):
-    d = result.get("decoded") if result else None
+    """取出本次请求的设备拒绝原因。
+
+    必须校验 matched：只有「匹配到本次请求」的错误帧才是本次 SET 的拒绝理由，
+    否则别的命令的错误帧会被误算到本次头上（评审第 3 条附带缺陷 1）。
+    """
+    if not result:
+        return None
+    if result.get("matched") is not True:
+        return None
+    d = result.get("decoded") or None
     if d and d.get("frame_type") == "error":
         code = d["payload"][0] if d.get("payload") else None
         name = ERROR_NAMES.get(code, f"错误码 {code}")
@@ -726,10 +940,89 @@ def _error_of(result):
     return None
 
 
+def _write_no_reply_ok(result):
+    """SET 无 ACK 是正常现象（真机 SET 不回 ACK，靠写后重读验证）。
+
+    只在「确实没收到任何匹配帧，且失败原因就是无响应」时标记，前端日志的
+    `!step.no_reply_ok` 分支才能把真实的写失败显示成红色。
+    """
+    return (result.get("matched") is False
+            and result.get("error") == "无响应"
+            and not result.get("decoded"))
+
+
+def _classify_write(set_result, after, expected, expected_label="目标"):
+    """统一判定一次「写 + 重读」的结果，返回 (ok, message, extra)。
+
+    判定优先级：串口写失败 > 匹配到的设备拒绝 > 有 ACK > 未匹配响应 >
+    无 ACK（此时才用重读值判定）> 重读失败。
+
+    关键点（评审第 3 条）：明确的失败永远优先于「重读值恰好等于期望值」。
+    设备本来就处于期望状态时，重读一致不能证明这次写入成功。
+    """
+    error_name = _error_of(set_result)
+    write_error = set_result.get("error")
+    matched = set_result.get("matched")
+    has_ack = matched is True and not error_name
+    extra = {"requested": expected, "after": after}
+    if error_name:
+        extra["set_error"] = error_name
+
+    if write_error and write_error != "无响应":
+        return False, f"写入失败：{write_error}", extra
+    if error_name:
+        return False, f"设备拒绝：{error_name}", extra
+    if matched is False and not write_error:
+        return False, "未收到匹配的响应帧", extra
+    if has_ack:
+        if after == expected:
+            return True, "写入后重读一致", extra
+        if after is None:
+            return False, "设备已确认写入，但重读无响应", extra
+        return False, (
+            f"设备已确认写入，但重读值 {_fmt_value(after)} "
+            f"与{expected_label} {_fmt_value(expected)} 不一致"), extra
+    # 走到这里只可能是「SET 无 ACK」：沿用既有设计，用写后重读判定。
+    if after == expected:
+        return True, "写入后重读一致", extra
+    if after is None:
+        return False, "写入已发送，但重读无响应", extra
+    return False, (
+        f"重读值 {_fmt_value(after)} 与{expected_label} {_fmt_value(expected)} 不一致"), extra
+
+
 def _mark_online(steps):
     global device_online
     if any(step.get("decoded") is not None for step in steps):
         device_online = True
+
+
+# 重发不安全（写类）的命令白名单，键为 (Feature, Cmd)，Cmd 不含 0x80 位。
+# 读命令重发是幂等的，可以放心重试；写命令一旦在设备已经执行后重发，就可能
+# 被执行两次，尤其是编解码切换会触发蓝牙重协商、把连接打断。
+WRITE_CMDS = {
+    (0x00, 0x07), (0x00, 0x08), (0x00, 0x0D),          # 注册/取消通知、设置传输参数
+    (0x20, 0x03), (0x20, 0x04), (0x20, 0x06),          # LC3/LDAC/LHDC 切换：会触发重协商
+    (0x1C, 0x02),                                       # 写入提示音
+    (0x1E, 0x02),                                       # 设置增益
+    (0x26, 0x02),                                       # 设置指示灯
+    (0x28, 0x02), (0x28, 0x04), (0x28, 0x07),          # 一拖二开关/超时/操作
+    (0x2C, 0x03),                                       # 写入手势
+    (0x40, 0x04), (0x40, 0x2A),                        # 设置 ANC 模式/切换配置
+    (0x0A, 0x06),                                       # EQ 写入
+}
+
+
+def _retry_safe(feature, cmd):
+    """判断该命令能否安全重发（幂等读命令可以，写命令不行）。"""
+    if cmd & 0x80:
+        return False
+    return ((feature & 0xFE), (cmd & 0x7F)) not in WRITE_CMDS
+
+
+def _send_retries(feature, cmd):
+    """按命令语义决定 /api/send 的重试次数：写命令不重发，读命令重试 1 次。"""
+    return 1 if _retry_safe(feature, cmd) else 0
 
 
 def _fmt_value(value):
@@ -750,15 +1043,18 @@ def _finish(action, steps, ok, message, **extra):
 
 
 def _set_verify(action, set_spec, read_spec, expected, label_set, label_read, extract):
-    """写一条 SET，等待片刻后重读校验。SET 是否回 ACK 不影响校验结论。"""
+    """写一条 SET，等待片刻后重读校验。
+
+    设备是否回 ACK 不影响结论：有 ACK 就直接采信 ACK，没 ACK 才用重读值判定；
+    但明确的失败（写失败、设备拒绝帧）永远优先（评审第 3 条）。
+    """
     set_feature, set_cmd, set_payload = set_spec
     steps = []
     set_result = send_cmd(set_feature, set_cmd, set_payload, timeout=0.5, retries=0)
     set_result["label"] = label_set
-    set_result["no_reply_ok"] = True
+    if _write_no_reply_ok(set_result):
+        set_result["no_reply_ok"] = True
     steps.append(set_result)
-    set_error = _error_of(set_result)
-    set_failure = set_result.get("error")
 
     time.sleep(0.2)
     read_result = send_cmd(read_spec[0], read_spec[1], "", timeout=1.0, retries=1)
@@ -767,23 +1063,7 @@ def _set_verify(action, set_spec, read_spec, expected, label_set, label_read, ex
 
     raw = _payload_of(read_result)
     after = extract(raw) if raw is not None else None
-    ok = after == expected
-    if ok:
-        message = "写入后重读一致"
-    elif set_failure and set_failure != "无响应":
-        message = f"写入失败：{set_failure}"
-    elif set_error:
-        message = f"设备拒绝：{set_error}"
-    elif after is None and read_result.get("error"):
-        message = f"重读失败：{read_result['error']}"
-    elif after is None:
-        message = "写入已发送，但重读无响应"
-    else:
-        message = f"重读值 {_fmt_value(after)} 与目标 {_fmt_value(expected)} 不一致"
-
-    extra = {"requested": expected, "after": after}
-    if set_error:
-        extra["set_error"] = set_error
+    ok, message, extra = _classify_write(set_result, after, expected)
     return _finish(action, steps, ok, message, **extra)
 
 
@@ -996,9 +1276,9 @@ def set_touch(values):
 
     write_result = send_cmd(0x2C, 0x03, bytes(values).hex(" "), timeout=0.5, retries=0)
     write_result["label"] = "写入手势（整包 5 字节）"
-    write_result["no_reply_ok"] = True
+    if _write_no_reply_ok(write_result):
+        write_result["no_reply_ok"] = True
     steps.append(write_result)
-    set_error = _error_of(write_result)
 
     time.sleep(0.25)
     read_result = send_cmd(0x2C, 0x02, "", timeout=1.0, retries=1)
@@ -1006,22 +1286,11 @@ def set_touch(values):
     steps.append(read_result)
     after_raw = _payload_of(read_result)
     after = after_raw[:5] if after_raw is not None and len(after_raw) >= 5 else None
-    ok = after == values
+    ok, message, extra = _classify_write(write_result, after, values, "写入值")
 
-    if ok:
-        message = "写入后重读一致"
-    elif set_error:
-        message = f"设备拒绝：{set_error}"
-    elif after is None:
-        message = "写入已发送，但重读无响应"
-    else:
-        message = f"重读值 {_fmt_value(after)} 与写入值 {_fmt_value(values)} 不一致"
-
-    extra = {"before": before, "requested": values, "after": after}
+    extra["before"] = before
     if before is None:
         extra["warning"] = "写入前无法读取当前手势，已按提交的完整 5 字节写入"
-    if set_error:
-        extra["set_error"] = set_error
     return _finish("写入手势", steps, ok, message, **extra)
 
 
@@ -1055,9 +1324,9 @@ def set_tone(enabled=None, volume=None, index=None):
     payload = bytes([enabled, volume, index])
     write_result = send_cmd(0x1C, 0x02, payload.hex(" "), timeout=0.5, retries=0)
     write_result["label"] = "写入提示音（3 字节）"
-    write_result["no_reply_ok"] = True
+    if _write_no_reply_ok(write_result):
+        write_result["no_reply_ok"] = True
     steps.append(write_result)
-    set_error = _error_of(write_result)
 
     time.sleep(0.2)
     read_result = send_cmd(0x1C, 0x01, "", timeout=1.0, retries=1)
@@ -1067,22 +1336,11 @@ def set_tone(enabled=None, volume=None, index=None):
     after = ([after_raw[0] & 0x01, after_raw[1] & 0xFF, after_raw[2] & 0xFF]
              if after_raw is not None and len(after_raw) >= 3 else None)
     requested = [enabled, volume, index]
-    ok = after == requested
+    ok, message, extra = _classify_write(write_result, after, requested, "写入值")
 
-    if ok:
-        message = "写入后重读一致"
-    elif set_error:
-        message = f"设备拒绝：{set_error}"
-    elif after is None:
-        message = "写入已发送，但重读无响应"
-    else:
-        message = f"重读值 {_fmt_value(after)} 与写入值 {_fmt_value(requested)} 不一致"
-
-    extra = {"before": before, "requested": requested, "after": after}
+    extra["before"] = before
     if before is None:
         extra["warning"] = "写入前无法读取当前提示音，已按提交的完整 3 字节写入"
-    if set_error:
-        extra["set_error"] = set_error
     return _finish("设置提示音", steps, ok, message, **extra)
 
 
@@ -1559,8 +1817,11 @@ function logStep(step){
   const txRaw = (tx && tx.raw) || step.tx_raw || '';
   const rxRaw = step.rx_raw || '';
   let cls = 'warn';
-  if(rxRaw){
-    cls = (d && d.frame_type === 'error') ? 'err' : 'ok';
+  if(d && d.frame_type === 'error'){
+    cls = 'err';
+  }else if(rxRaw){
+    if(step.matched === false) cls = 'err';
+    else cls = 'ok';
   }else if(step.error && !step.no_reply_ok){
     cls = 'err';
   }
@@ -1841,6 +2102,20 @@ async function apiCall(path, label){
   }
 }
 
+// 把 /api/send 的显式判定翻译成一句用户能看懂的失败原因。
+// 后端现在会给出 ok/status/error_name/matched，不再靠「有 decoded 就算成功」猜。
+function replyFailureText(data, step, fallback){
+  if(data && data.error_name) return '设备拒绝：' + data.error_name;
+  if(step && step.decoded && step.decoded.frame_type === 'error'){
+    return '设备拒绝：' + (step.decoded.summary || '命令被拒绝');
+  }
+  if(data && data.status === 'unmatched') return '收到响应但与本命令不匹配';
+  if(data && data.status === 'unparsed') return '收到无法解析的帧';
+  if(step && step.error) return step.error;
+  if(data && data.error) return data.error;
+  return fallback;
+}
+
 async function refreshAll(){
   try{
     const data = await apiCall('/api/state', '全量刷新');
@@ -2040,8 +2315,8 @@ async function sendCustom(){
   try{
     const data = await apiCall('/api/send?feature=' + feature + '&cmd=' + cmd + '&payload=' + encodeURIComponent(payload), '自定义命令');
     const step = data.steps && data.steps[0];
-    if(!step || step.error || !step.decoded){
-      toast((step && step.error) || '未收到响应', false);
+    if(!data.ok || !step){
+      toast(replyFailureText(data, step, '未收到响应'), false);
       return;
     }
     toast('命令已发送', true);
@@ -2054,8 +2329,12 @@ async function sendPreset(preset){
   try{
     const data = await apiCall('/api/send?feature=' + preset.feature + '&cmd=' + preset.cmd + '&payload=' + encodeURIComponent(preset.payload || ''), '快捷: ' + preset.name);
     const step = data.steps && data.steps[0];
-    if(!step || step.error || !step.decoded){
-      toast((step && step.error) || '未收到响应', false);
+    if(!data.ok || !step){
+      toast(replyFailureText(data, step, preset.name + ' 读取失败'), false);
+      return;
+    }
+    if(step.decoded && step.decoded.frame_type === 'error'){
+      toast('设备错误：' + (step.decoded.summary || '命令被拒绝'), false);
       return;
     }
     toast(preset.name + ' 已读取', true);
@@ -2258,7 +2537,7 @@ class Handler(BaseHTTPRequestHandler):
             feature = _req_int(q, "feature", 0, 0xFF)
             cmd = _req_int(q, "cmd", 0, 0xFF)
             payload = q.get("payload", [""])[0]
-            result = send_cmd(feature, cmd, payload)
+            result = send_cmd(feature, cmd, payload, retries=_send_retries(feature, cmd))
             result["label"] = "自定义命令"
             return {
                 "steps": [result],
@@ -2266,6 +2545,12 @@ class Handler(BaseHTTPRequestHandler):
                 "rx_raw": result.get("rx_raw"),
                 "decoded": result.get("decoded"),
                 "error": result.get("error"),
+                # 显式判定：前端与 curl 都不用再靠「有 decoded」猜成功。
+                "ok": result.get("ok") is True,
+                "status": result.get("status"),
+                "matched": result.get("matched"),
+                "error_name": result.get("error_name"),
+                "frames": result.get("frames"),
             }
         if path == "/api/set/anc":
             return set_anc(_req_int(q, "mode", 0, 4))
