@@ -1,7 +1,15 @@
-# Gradle
+# Gradle / Kotlin JVM
 .gradle/
+.kotlin/
 build/
-!gradle/wrapper/gradle-wrapper.jar
+out/
+/dist/
+local.properties
+*.class
+*.jar
+*.war
+*.ear
+!/gradle/wrapper/gradle-wrapper.jar
 
 # IDE
 .idea/
@@ -9,12 +17,6 @@ build/
 *.ipr
 *.iws
 .vscode/
-
-# Kotlin
-*.class
-*.war
-*.ear
-out/
 
 # OS
 .DS_Store
@@ -24,17 +26,33 @@ ehthumbs.db
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-.env
+*.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
 
-# Logs
+# 本地环境配置
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# 日志与蓝牙抓包
 *.log
+*.btsnoop
+*.pcap
+*.pcapng
 
-# APK / 反编译产物 (太大不入库)
-android-release.apk
+# APK / 反编译产物
+*.apk
+*.apks
+*.xapk
 _apk_extract/
 tools/decompiled/
 tools/decompile/
@@ -60,9 +78,6 @@ tools/search_*.py
 tools/enable_*.sh
 tools/decompile_*.py
 tools/ble_*.py
-tools/ble_connect.py
-tools/ble_discover.py
-tools/ble_scan.py
 tools/bluetooth_test.py
 tools/jieli_*.py
 tools/anc_*.py
@@ -70,13 +85,11 @@ tools/oppo_*.py
 tools/try_*.py
 tools/check_*.py
 
-# btsnoop 抓包日志
-docs/btsnoop_hci_*.log
-
-# 临时文档
-promat.md
+# 本地工作交接
+/prompt.md
 
 # 本地截图与 Playwright 缓存（docs/ 下的文档截图不受影响）
 .playwright-cli/
+.playwright-mcp/
 /*.png
 /*.zip

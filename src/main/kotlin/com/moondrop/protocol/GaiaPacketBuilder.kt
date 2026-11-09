@@ -17,19 +17,23 @@ object GaiaPacketBuilder {
 
     fun ancQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_ANC, GaiaConstants.CMD_ANC_QUERY)
 
-    fun ancSet(mode: Byte): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_ANC, GaiaConstants.CMD_ANC_SET, byteArrayOf(mode))
+    fun ancSet(mode: Byte): GaiaPacket =
+        GaiaPacket(GaiaConstants.FEATURE_ANC, GaiaConstants.CMD_ANC_SET, byteArrayOf(mode))
 
     fun ancSet(mode: AncMode): GaiaPacket = ancSet(mode.value)
 
     fun ancConfigQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_ANC, GaiaConstants.CMD_ANC_CONFIG_READ)
 
-    fun ancConfigSet(values: ByteArray): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_ANC, GaiaConstants.CMD_ANC_CONFIG_WRITE, values)
+    fun ancConfigSet(values: ByteArray): GaiaPacket =
+        GaiaPacket(GaiaConstants.FEATURE_ANC, GaiaConstants.CMD_ANC_CONFIG_WRITE, values)
 
     // ========== 基础域 (Feature 0x00) ==========
 
-    fun supportedFeaturesQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_BASE, GaiaConstants.CMD_SUPPORTED_FEATURES)
+    fun supportedFeaturesQuery(): GaiaPacket =
+        GaiaPacket(GaiaConstants.FEATURE_BASE, GaiaConstants.CMD_SUPPORTED_FEATURES)
 
-    fun supportedFeaturesNextQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_BASE, GaiaConstants.CMD_SUPPORTED_FEATURES_NEXT)
+    fun supportedFeaturesNextQuery(): GaiaPacket =
+        GaiaPacket(GaiaConstants.FEATURE_BASE, GaiaConstants.CMD_SUPPORTED_FEATURES_NEXT)
 
     fun deviceSerialNumberQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_BASE, GaiaConstants.CMD_SERIAL_NUMBER)
 
@@ -37,7 +41,8 @@ object GaiaPacketBuilder {
 
     fun rightEarbudSerialNumberQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_BASE, GaiaConstants.CMD_EARBUD_SN_R)
 
-    fun applicationVersionQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_BASE, GaiaConstants.CMD_APPLICATION_VERSION)
+    fun applicationVersionQuery(): GaiaPacket =
+        GaiaPacket(GaiaConstants.FEATURE_BASE, GaiaConstants.CMD_APPLICATION_VERSION)
 
     /** 旧名；APK 中 0x05 是 APPLICATION_VERSION。 */
     fun firmwareVersionQuery(): GaiaPacket = applicationVersionQuery()
@@ -60,7 +65,8 @@ object GaiaPacketBuilder {
 
     fun gainQuery(): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_GAIN, GaiaConstants.CMD_GAIN_QUERY)
 
-    fun gainSet(level: Byte): GaiaPacket = GaiaPacket(GaiaConstants.FEATURE_GAIN, GaiaConstants.CMD_GAIN_SET, byteArrayOf(level))
+    fun gainSet(level: Byte): GaiaPacket =
+        GaiaPacket(GaiaConstants.FEATURE_GAIN, GaiaConstants.CMD_GAIN_SET, byteArrayOf(level))
 
     fun gainSet(level: GainLevel): GaiaPacket = gainSet(level.value)
 

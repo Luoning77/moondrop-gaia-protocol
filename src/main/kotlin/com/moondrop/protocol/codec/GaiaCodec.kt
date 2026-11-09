@@ -20,7 +20,12 @@ object GaiaCodec {
 
     // ========== 编码 ==========
 
-    fun encode(featureId: Int, commandId: Int, payload: ByteArray = byteArrayOf(), sequence: Byte = 0x00): ByteArray {
+    fun encode(
+        featureId: Int,
+        commandId: Int,
+        payload: ByteArray = byteArrayOf(),
+        sequence: Byte = 0x00,
+    ): ByteArray {
         val pkt = ByteArray(8 + payload.size)
         pkt[0] = GaiaConstants.HEADER_0
         pkt[1] = GaiaConstants.HEADER_1
