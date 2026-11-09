@@ -728,3 +728,242 @@ def test_issue4_python_summary_unknown_codec():
         "与 Kotlin parseCodecSwitch 的 0x00/0x01/其余 三态语义不一致。对应评审第 4 条（Python 镜像）。"
     )
 
+
+# ---------------------------------------------------------------------------
+# 评审第 6 条：仍然残留的「decoded 存在即成功」判据
+# ---------------------------------------------------------------------------
+def _fast_read_state(monkeypatch):
+    """read_state() 内部用的 timeout 是给真机调的（0.6~1.2s）。
+
+    测试里设备要么立刻应答、要么完全不应答，不需要等那么久；
+    这里把传给 send_cmd 的 timeout 统一压到 0.05s，让用例跑快些。
+    """
+    real_send_cmd = webtest.send_cmd
+
+    def fast_send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
+        return real_send_cmd(feature, cmd, payload_hex,
+                             timeout=min(timeout, 0.05), retries=retries)
+
+    monkeypatch.setattr(webtest, "send_cmd", fast_send_cmd)
+
+
+def test_issue6_read_state_error_frame_means_online(monkeypatch):
+    """固件探活命中设备错误帧时，设备其实在线，不能判 offline 而跳过全部读取。
+
+    触发条件：设备对 `00 05`（读固件）回错误帧。旧实现只判
+    `probe.get("decoded") is None`，会把这种情况当成「设备不在」，
+    直接返回 online=False 且跳过后面 12 项读取。
+    """
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        (0x00, 0x05): _device_error(0x00, 0x05, 1),      # 设备拒绝读固件
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),  # 但其它读取正常
+    }))
+    result = webtest.read_state()
+
+    assert result["online"] is True, (
+        "期望固件探活收到设备错误帧时仍判 online=True（设备给了应答，说明在线），"
+        f"实际 online={result['online']!r}、probe_status={result.get('probe_status')!r}。"
+        "旧判据只检查 decoded 是否存在之外的情况会误判离线。对应评审第 6 条。"
+    )
+    assert result["state"].get("anc") == 0x02, (
+        "期望设备在线时继续读取其余项并填充 state，"
+        f"实际 state={result['state']!r}。探活命中错误帧不应跳过全部读取。对应评审第 6 条。"
+    )
+    assert result["answered"] is True, (
+        "期望 answered=True（其余项里有匹配的响应帧），"
+        f"实际 answered={result['answered']!r}。对应评审第 6 条。"
+    )
+
+
+def test_issue6_read_state_no_reply_is_offline(monkeypatch):
+    """设备完全无应答时判 offline，并保持「快速失败、不逐项等超时」的行为。"""
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({}))          # 任何命令都不回
+    result = webtest.read_state()
+
+    assert result["online"] is False, (
+        f"期望设备无任何应答时 online=False，实际 {result['online']!r}。"
+    )
+    assert result["state"] == {}, (
+        f"期望离线时 state 为空、跳过后续读取，实际 {result['state']!r}。"
+    )
+    assert len(result["steps"]) == 2, (
+        "期望离线时只发两条探活命令（固件 + 电量兜底），不逐项等 12 项超时，"
+        f"实际发了 {len(result['steps'])} 条。"
+    )
+
+
+def test_issue6_read_state_notification_is_not_online(monkeypatch):
+    """只收到无关通知帧时不能据此判在线（通知不能证明设备响应了本次请求）。"""
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        # 探活请求没有匹配响应，但链路上有异步通知推送
+        (0x00, 0x05): _notification(0x40, 0x03, bytes([0x01])),
+    }))
+    result = webtest.read_state()
+
+    assert result["online"] is False, (
+        "期望只收到无关通知帧时判 online=False（通知不能证明设备响应了本次请求），"
+        f"实际 online={result['online']!r}、probe_status={result.get('probe_status')!r}。"
+        "旧判据 any(decoded is not None) 会把通知帧算成在线证据。对应评审第 6 条。"
+    )
+
+
+def test_issue6_api_check_reports_answered_separately():
+    """/api/check 要把「设备在线但拒绝」与「设备离线」区分开。"""
+    _install(_simple_device({
+        (0x00, 0x05): _device_error(0x00, 0x05, 1),
+    }))
+    payload = webtest.Handler._route(_FakeHandler(), "/api/check", {})
+
+    assert payload["online"] is True, (
+        "期望设备回错误帧时 online=True（设备给了应答），"
+        f"实际 online={payload['online']!r}。对应评审第 6 条。"
+    )
+    assert payload["answered"] is False, (
+        f"期望 answered=False（应答不符合请求），实际 {payload['answered']!r}。"
+    )
+    assert payload.get("status") == "device_error", (
+        f"期望 status='device_error'，实际 {payload.get('status')!r}，"
+        "前端需要它来显示「设备拒绝」而不是「设备离线」。对应评审第 6 条。"
+    )
+    assert payload.get("error_name"), (
+        f"期望带上 error_name 便于前端显示具体拒绝原因，实际 {payload.get('error_name')!r}。"
+    )
+
+
+def test_issue6_battery_error_frame_not_success():
+    """电量查询返回错误帧时，前端判据必须失败（否则页面提示「已刷新」但值没更新）。
+
+    前端 refreshBattery() 当前判据是 `!step || step.error || !step.decoded`，
+    要求改为使用 /api/send 返回的 data.ok，并要求电量 payload 真实存在。
+    这里按修改后的正确判据断言后端返回的字段组合。
+    """
+    _install(_simple_device({
+        (0x1A, 0x01): _device_error(0x1A, 0x01, 5),      # 电量查询被拒绝
+    }))
+    query = {"feature": ["26"], "cmd": ["1"], "payload": ["010203"]}  # 0x1A, 0x01
+    payload = webtest.Handler._route(_FakeHandler(), "/api/send", query)
+
+    step = payload["steps"][0]
+    decoded = step.get("decoded") or {}
+    assert decoded.get("frame_type") == "error", (
+        f"前置条件不成立：期望电量查询收到错误帧，实际 decoded={decoded!r}"
+    )
+    # 错误帧路径下 decode_packet 不会设置 battery 字段（见 webtest.py 约 276 行）
+    assert not decoded.get("battery"), (
+        f"前置条件不成立：错误帧不应带 battery 字段，实际 {decoded.get('battery')!r}"
+    )
+    # 正确的前端判据：data.ok && decoded.battery
+    frontend_ok = bool(payload.get("ok")) and bool(decoded.get("battery"))
+    assert frontend_ok is False, (
+        "期望电量读取被拒绝时前端判据为假，实际为真——页面会提示「电量已刷新」"
+        f"但电量没有更新。payload ok={payload.get('ok')!r}、"
+        f"status={payload.get('status')!r}、battery={decoded.get('battery')!r}。"
+        "对应评审第 6 条。"
+    )
+
+
+def test_issue6_mark_online_requires_device_answer():
+    """_mark_online 不能用「decoded 存在」判在线：通知帧不算设备应答。"""
+    notification_only = [
+        {"decoded": webtest.decode_packet(_notification(0x40, 0x03, bytes([1])))},
+    ]
+    webtest.device_online = False
+    webtest._mark_online(notification_only)
+    assert webtest.device_online is False, (
+        "期望只有通知帧时 _mark_online 不把设备标记为在线（通知不能证明设备响应了请求），"
+        f"实际 device_online={webtest.device_online!r}。对应评审第 6 条。"
+    )
+
+    error_frame = webtest.decode_packet(_device_error(0x40, 0x04, 5))
+    webtest._mark_online([{"decoded": error_frame}])
+    assert webtest.device_online is True, (
+        "期望收到设备错误帧时 _mark_online 判在线（设备明确拒绝了命令，说明设备在），"
+        f"实际 device_online={webtest.device_online!r}。对应评审第 6 条。"
+    )
+
+
+def test_issue6_firmware_requires_matched(monkeypatch):
+    """固件版本必须校验 matched：不能把「其它命令」的响应当成固件版本。
+
+    复现：请求 00 05（读固件），设备回一条 00 03（设备序列号）的响应。
+    两者 frame_type 都是 response，但 matched=False，旧判据（只检查
+    frame_type == "response"）会把序列号显示成页头的固件版本。
+    """
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        # 请求 00 05，回的是 00 03 的响应（帧结构合法，但命令对不上）
+        (0x00, 0x05): _response(0x00, 0x03, b"20560023326101203277"),
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),
+    }))
+    result = webtest.read_state()
+
+    probe = result["steps"][0]
+    assert probe.get("matched") is False, (
+        f"前置条件不成立：期望探活帧 matched=False，实际 {probe.get('matched')!r}"
+    )
+    assert "firmware" not in result["state"], (
+        "期望 matched=False 的帧不被当成固件版本，实际 firmware="
+        f"{result['state'].get('firmware')!r}（这是 00 03 设备序列号）。"
+        "旧判据只检查 frame_type == 'response'，没校验 matched。对应评审第 6 条。"
+    )
+
+
+def test_issue6_probe_ladder_falls_back_to_battery(monkeypatch):
+    """固件查询无回帧、但其它命令正常应答时，不能判离线。
+
+    真机上 00 00 / 00 03 确实无回帧（见报告 4.2 节），所以「无回帧」≠「设备不在」。
+    修复后应有第二级探活（电量），任一有应答即视为在线并继续读取。
+    """
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        # 00 05 无任何回帧
+        (0x1A, 0x01): _response(0x1A, 0x01, bytes([1, 82, 2, 79, 3, 0xFF])),
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),
+        (0x26, 0x01): _response(0x26, 0x01, bytes([1])),
+    }))
+    result = webtest.read_state()
+
+    assert result["online"] is True, (
+        "期望固件查询无回帧、但电量查询有应答时判 online=True，"
+        f"实际 online={result['online']!r}、probe_status={result.get('probe_status')!r}。"
+        "「无回帧」不等于「设备不在」。对应评审第 6 条。"
+    )
+    assert result["state"], (
+        f"期望继续读取其余项并填充 state，实际 state={result['state']!r}。"
+    )
+    assert result["state"].get("anc") == 0x02, (
+        f"期望 state 含 anc=0x02，实际 {result['state']!r}。"
+    )
+
+
+def test_issue6_firmware_matched_response_still_works(monkeypatch):
+    """回归基准：固件查询正常匹配时，firmware 必须正常写入。"""
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        (0x00, 0x05): _response(0x00, 0x05, b"3.5.6"),
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),
+    }))
+    result = webtest.read_state()
+
+    assert result["state"].get("firmware") == "3.5.6", (
+        "期望正常匹配的固件响应仍能写入 state，"
+        f"实际 firmware={result['state'].get('firmware')!r}。修改不能破坏正常路径。"
+    )
+
+
+def test_issue6_api_status_online_requires_connected(monkeypatch):
+    """/api/status 的 online 不能在没有连接时返回 True（device_online 是陈旧值）。"""
+    webtest.device_online = True          # 模拟上一次读取留下的在线状态
+    webtest.ser = None                    # 串口已关闭
+    payload = webtest.Handler._route(_FakeHandler(), "/api/status", {})
+
+    assert payload["connected"] is False, f"前置条件：期望 connected=False，实际 {payload!r}"
+    assert payload["online"] is False, (
+        "期望串口未连接时 /api/status 的 online=False，"
+        f"实际 online={payload['online']!r}。device_online 是全局陈旧值，"
+        "必须与 connected 取与。对应评审第 6 条。"
+    )
+

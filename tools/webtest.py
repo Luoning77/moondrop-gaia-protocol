@@ -991,9 +991,31 @@ def _classify_write(set_result, after, expected, expected_label="目标"):
         f"重读值 {_fmt_value(after)} 与{expected_label} {_fmt_value(expected)} 不一致"), extra
 
 
+def _step_answered(step):
+    """该步骤是否收到了「来自设备」的应答帧。
+
+    错误帧也是设备在线的证据（设备明确拒绝了命令 ≠ 设备不在），
+    但无关通知帧不算：它只说明链路有推送，不能证明设备处理了本次请求。
+    """
+    d = step.get("decoded") if step else None
+    if not d:
+        return False
+    return d.get("frame_type") in ("response", "error")
+
+
+def _step_ok(step):
+    """该步骤是否成功：必须是匹配到本次请求的响应帧，且不是设备错误帧。"""
+    return bool(step) and step.get("ok") is True
+
+
 def _mark_online(steps):
+    """只要有一步收到了设备的应答（含错误帧）就认为设备在线。
+
+    不能用「decoded 存在」判断：无关通知帧也有 decoded，但那不能证明设备
+    响应了本次请求（评审第 6 条）。
+    """
     global device_online
-    if any(step.get("decoded") is not None for step in steps):
+    if any(_step_answered(step) for step in steps):
         device_online = True
 
 
@@ -1091,15 +1113,35 @@ def read_state():
     steps = []
     by_key = {}
 
-    # 先用固件查询探活：没有响应就不再逐项等超时，避免离线时页面卡十几秒。
-    probe = send_cmd(0x00, 0x05, "", timeout=1.2, retries=1)
+    # 探活采用两级阶梯：完全没有应答才判定离线，避免「某条命令不支持」被误判成离线。
+    #
+    # 判据是「有没有来自设备的应答」而不是「decoded 是否存在」（评审第 6 条）：
+    #   - 收到匹配响应 / 设备错误帧：设备在，继续读其余项
+    #   - 无响应：可能是设备不在，也可能只是这条命令不被支持（真机上 00 00、00 03
+    #     就确实无回帧），所以补一条面板本来就要读的命令再确认一次
+    #   - 只收到无关通知：不能据此判在线，但也不值得再等满 12 项
+    probe = send_cmd(0x00, 0x05, "", timeout=1.0, retries=1)
     probe["label"] = "读取固件版本"
     steps.append(probe)
     by_key["firmware"] = probe
-    if probe.get("decoded") is None:
+    probe_status = probe.get("status")
+
+    probe2 = None
+    if not _step_answered(probe) and probe_status in ("timeout", "unparsed"):
+        # 兜底探活：电量查询面板本来就要读，用它确认设备是否真的不在。
+        probe2 = send_cmd(0x1A, 0x01, "010203", timeout=0.6, retries=0)
+        probe2["label"] = "探活（读取电量）"
+        steps.append(probe2)
+        by_key["battery"] = probe2
+        probe_status = probe2.get("status")
+
+    if probe2 is not None and not _step_answered(probe2):
+        # 两条探活都没有任何应答：判定离线，跳过其余读取，避免页面卡十几秒。
         device_online = False
         return {
             "online": False,
+            "answered": False,
+            "probe_status": probe_status,
             "demo": isinstance(ser, MockSerial),
             "port": getattr(ser, "port", None),
             "state": {},
@@ -1107,6 +1149,9 @@ def read_state():
         }
 
     for key, feature, cmd, payload, timeout, retries, label in STATE_READS:
+        if key in by_key:
+            # 兜底探活时已经读过电量，不要重复发。
+            continue
         result = send_cmd(feature, cmd, payload, timeout=timeout, retries=retries)
         result["label"] = label
         steps.append(result)
@@ -1117,10 +1162,16 @@ def read_state():
     def payload(key):
         return _payload_of(by_key.get(key))
 
-    res = by_key.get("firmware")
-    if res and res.get("decoded") and res["decoded"].get("frame_type") == "response":
-        if res["decoded"].get("ascii"):
-            state["firmware"] = res["decoded"]["ascii"]
+    # firmware 也必须校验 matched（评审第 6 条遗漏）：
+    # 只看 decoded.frame_type == "response" 不够 —— 设备回一条「其它命令」的响应帧
+    # （例如请求 00 05 却收到 00 03 设备序列号）时 frame_type 同样是 response，
+    # 但 matched=False，旧判据会把序列号当成固件版本显示在页头。
+    # _payload_of() 已过滤 error/notification/matched=False，直接复用。
+    fw = by_key.get("firmware")
+    if _payload_of(fw) is not None:
+        ascii_text = (fw.get("decoded") or {}).get("ascii")
+        if ascii_text:
+            state["firmware"] = ascii_text
 
     p = payload("battery")
     if p is not None:
@@ -1166,10 +1217,16 @@ def read_state():
     if p:
         state["onebringtwo_timeout"] = p[0]
 
-    online = any(step.get("decoded") is not None for step in steps)
+    # online：设备对本次请求有过应答（含错误帧）——「设备在」的证据。
+    # 不能再用 decoded 是否存在判断：无关通知帧也有 decoded，但那不证明设备
+    # 响应了本次请求（评审第 6 条）。state 各项值本身由 _payload_of() 过滤
+    # （error/notification/matched=False 都返回 None），所以不受此判据影响。
+    online = any(_step_answered(step) for step in steps)
+    answered = any(_step_ok(step) for step in steps)
     device_online = online
     return {
         "online": online,
+        "answered": answered,
         "demo": isinstance(ser, MockSerial),
         "port": getattr(ser, "port", None),
         "state": state,
@@ -2134,8 +2191,12 @@ async function refreshBattery(silent){
   try{
     const data = await apiCall('/api/send?feature=26&cmd=1&payload=010203', '读取电量');
     const step = data.steps && data.steps[0];
-    if(!step || step.error || !step.decoded){
-      if(!silent) toast((step && step.error) || '电量读取失败', false);
+    // 必须用后端给的显式判定，不能只看 decoded 是否存在：设备返回可解码的
+    // 错误帧时 decoded 非空、step.error 也未必有值，旧判据会误报「电量已刷新」，
+    // 但页面上的电量并没有更新（评审第 6 条）。
+    const battery = step && step.decoded && step.decoded.battery;
+    if(!data.ok || !battery){
+      if(!silent) toast(replyFailureText(data, step, '电量读取失败'), false);
       return;
     }
     renderAll();
@@ -2198,14 +2259,18 @@ async function reloadTouch(){
     const step = data.steps && data.steps[0];
     const d = step && step.decoded;
     const payload = d && d.payload;
-    if(d && d.frame_type === 'response' && payload && payload.length >= 5){
+    // 必须用 data.ok 而不是「frame_type === 'response'」（评审第 6 条遗漏）：
+    // 设备可能回一条「其它命令」的 5 字节响应（例如 40 29 ANC 切换配置），
+    // frame_type 同样是 response 但 matched=False，旧判据会把 [1,1,1,1,0]
+    // 当成手势写进 S.touch，用户再点写入就写进设备了。
+    if(data.ok && payload && payload.length >= 5){
       S.touch = payload.slice(0,5);
       S.touchDirty = false;
       S.touchPending = null;
       renderAll();
       toast('已读取当前手势', true);
     }else{
-      throw new Error('没有拿到 5 字节手势配置');
+      throw new Error(replyFailureText(data, step, '没有拿到 5 字节手势配置'));
     }
   }catch(err){ toast(err.message || '读取手势失败', false); }
 }
@@ -2217,14 +2282,14 @@ async function loadTouchDefaults(){
     const step = data.steps && data.steps[0];
     const d = step && step.decoded;
     const payload = d && d.payload;
-    if(d && d.frame_type === 'response' && payload && payload.length >= 5){
+    if(data.ok && payload && payload.length >= 5){
       S.touchDefault = payload.slice(0,5);
       S.touchPending = payload.slice(0,5);
       S.touchDirty = true;
       renderAll();
       toast('已载入出厂默认：确认后再写入', true);
     }else{
-      throw new Error('没有拿到出厂默认手势');
+      throw new Error(replyFailureText(data, step, '没有拿到出厂默认手势'));
     }
   }catch(err){ toast(err.message || '读取出厂默认失败', false); }
 }
@@ -2512,18 +2577,29 @@ class Handler(BaseHTTPRequestHandler):
     def _route(self, path, q):
         global device_online
         if path == "/api/status":
+            connected = bool(ser is not None and ser.is_open)
             return {
-                "connected": bool(ser is not None and ser.is_open),
-                "online": device_online,
+                "connected": connected,
+                # online 必须与 connected 取与：串口关掉后 device_online 可能还是上一次
+                # 读到的旧值，单独返回会让 /api/status 报「没连上但在线」。
+                "online": connected and device_online,
                 "port": getattr(ser, "port", None),
                 "demo": isinstance(ser, MockSerial),
             }
         if path == "/api/check":
             result = send_cmd(0x00, 0x05, "", timeout=1.2, retries=1)
             result["label"] = "探测设备"
-            device_online = result.get("decoded") is not None
+            # online 表示「设备给过应答」（含错误帧，设备在线但拒绝该命令）；
+            # answered 表示「应答符合本次请求」。两者区分开，前端才能显示
+            # 「设备拒绝」而不是误报「设备离线」（评审第 6 条）。
+            online = _step_answered(result)
+            device_online = online
             return {
-                "online": device_online,
+                "connected": bool(ser is not None and ser.is_open),
+                "online": online,
+                "answered": _step_ok(result),
+                "status": result.get("status"),
+                "error_name": result.get("error_name"),
                 "demo": isinstance(ser, MockSerial),
                 "port": getattr(ser, "port", None),
                 "steps": [result],
