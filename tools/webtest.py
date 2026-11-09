@@ -10,9 +10,14 @@
 面板覆盖: 降噪五档、手势 5 行 × 左右耳、电量、增益、指示灯、
 提示音、LHDC、一拖二，并保留自定义 Feature/Cmd 与原始 TX/RX 日志。
 """
-import sys, json, time, threading
+
+import json
+import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
+
 import serial
 
 VENDOR_ID = 0x001D
@@ -637,33 +642,6 @@ class FrameSlice:
         return f"FrameSlice(frame={self.frame!r}, status={self.status!r})"
 
 
-def _holds_embedded_frame(buf, total):
-    """识别「Len 凑得够，于是把紧随其后的合法帧整段吞进 payload」这种切帧错误。
-
-    触发条件刻意收得很窄，只有同时满足才算坏帧：
-      1. payload 内部完整嵌着一个结构合法的帧（FF 04 + Vendor=0x1D + Len <= 上限且收全）；
-      2. 这个内嵌帧的结尾要么正好是本帧 payload 的结尾，要么紧接着又出现 FF 04 帧头。
-
-    条件 2 是「两个真实帧背靠背、外层 Len 被污染成更大的值」的专有特征。
-    只判断「payload 里出现过 FF 04」会误杀正常的大 payload（payload 里偶然含
-    FF 04 两字节很常见），所以这里不用那种宽松启发式。
-    """
-    limit = min(total, len(buf))
-    j = 8
-    while j + 8 <= limit:
-        if (buf[j] == 0xFF and buf[j + 1] == 0x04
-                and buf[j + 5] == (VENDOR_ID & 0xFF)):
-            body_len = (buf[j + 2] << 8) | buf[j + 3]
-            end = j + 8 + body_len
-            if body_len <= MAX_PAYLOAD and end <= limit:
-                if end == total:
-                    return True
-                if end + 1 < len(buf) and buf[end] == 0xFF and buf[end + 1] == 0x04:
-                    return True
-        j += 1
-    return False
-
-
 def _take_frame_ex(buf):
     """从缓冲区头部取一个 FF 04 帧，返回 (frame, rest, status) 三态。
 
@@ -671,8 +649,7 @@ def _take_frame_ex(buf):
     status 语义：
       FRAME_OK   取到完整且校验通过的帧，rest 是剩余字节
       FRAME_WAIT 帧头对、长度合法，但字节还没到齐（保留全部字节，不清缓冲）
-      FRAME_BAD  帧头非法、Vendor 不对、Len 超限，或切出来的 payload 里含着整帧
-                 （跨帧吞并），调用方丢 1 字节后重试
+      FRAME_BAD  帧头非法、Vendor 不对或 Len 超限，调用方丢 1 字节后重试
     """
     if len(buf) < 8:
         return None, buf, FRAME_WAIT
@@ -688,10 +665,6 @@ def _take_frame_ex(buf):
     total = 8 + body_len
     if len(buf) < total:
         return None, buf, FRAME_WAIT
-    if _holds_embedded_frame(buf, total):
-        # Len 刚好凑够、却把后面的合法帧吃进了 payload：判定为坏帧头，
-        # 丢 1 字节重新找帧边界，而不是静默产出错误数据。
-        return None, buf, FRAME_BAD
     return bytes(buf[:total]), buf[total:], FRAME_OK
 
 
@@ -739,7 +712,7 @@ def _recv_frame(timeout):
     """
     if not ser or not ser.is_open:
         return b""
-    deadline = time.time() + max(0.05, timeout)
+    deadline = time.time() + max(0, timeout)
     buf = bytearray(_rx_carry)
     _rx_carry.clear()
 
@@ -812,8 +785,16 @@ def _recv_frame(timeout):
             if buf.startswith(b"\x00\x1D") and len(buf) >= 4 and time.time() - last_rx >= 0.05:
                 return bytes(buf)
             time.sleep(0.005)
-    if buf:
-        _rx_carry.extend(buf)
+    # 等待期结束时外帧仍不完整，才尝试恢复后面的完整帧。
+    # 已按声明长度收齐的帧，其 payload 可以包含任意字节序列。
+    start = _find_frame_start(buf, 1)
+    while start >= 0:
+        frame, rest, status = _take_frame_ex(buf[start:])
+        if status == FRAME_OK:
+            _rx_carry.extend(rest)
+            return frame
+        start = _find_frame_start(buf, start + 1)
+    _rx_carry.extend(buf)
     return b""
 
 
@@ -835,13 +816,10 @@ def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
     last_decoded = None
     matched = False
     received = []            # 本次调用收到的全部帧（诊断用，含无关通知）
-    # 每次 send_cmd 开始时清一次 carry：carry 只用于「同一条命令内」跨多次
-    # _recv_frame 保留半帧/后续帧。跨请求残留会让上一条命令的多余帧被下一条
-    # 命令误判成自己的响应（典型：--demo-noack 下前一条读命令的 ACK 残留）。
-    # 重试时不清理，避免把本轮已有的合法帧丢掉（评审第 2 条附带缺陷）。
-    _rx_carry.clear()
-    for attempt in range(retries + 1):
-        with ser_lock:
+    # 同一条命令及其重试独占串口和应用层缓冲区。
+    with ser_lock:
+        _rx_carry.clear()
+        for attempt in range(retries + 1):
             if ser is None or not ser.is_open:
                 return _error_result(tx, "串口未连接")
             try:
@@ -855,7 +833,7 @@ def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
             deadline = time.time() + max(0.05, timeout)
             while True:
                 remaining = deadline - time.time()
-                if remaining <= 0:
+                if remaining <= 0 and not _rx_carry:
                     break
                 frame = _recv_frame(remaining)
                 if not frame:
@@ -873,10 +851,10 @@ def send_cmd(feature, cmd, payload_hex="", timeout=1.0, retries=1):
                     matched = True
                     break
                 # 无关通知/其他命令的响应：不结束重试，继续等本次真正的响应。
-        if matched:
-            break
-        if attempt < retries:
-            time.sleep(0.08)
+            if matched:
+                break
+            if attempt < retries:
+                time.sleep(0.08)
 
     result = {
         "tx": decode_packet(tx),
@@ -1024,10 +1002,10 @@ def _step_answered(step):
     错误帧也是设备在线的证据（设备明确拒绝了命令 ≠ 设备不在），
     但无关通知帧不算：它只说明链路有推送，不能证明设备处理了本次请求。
     """
-    d = step.get("decoded") if step else None
-    if not d:
+    if not step or step.get("matched") is not True:
         return False
-    return d.get("frame_type") in ("response", "error")
+    decoded = step.get("decoded") or {}
+    return decoded.get("frame_type") in ("response", "error")
 
 
 def _step_ok(step):
@@ -1046,32 +1024,18 @@ def _mark_online(steps):
         device_online = True
 
 
-# 重发不安全（写类）的命令白名单，键为 (Feature, Cmd)，Cmd 不含 0x80 位。
-# 读命令重发是幂等的，可以放心重试；写命令一旦在设备已经执行后重发，就可能
-# 被执行两次，尤其是编解码切换会触发蓝牙重协商、把连接打断。
-WRITE_CMDS = {
-    (0x00, 0x07), (0x00, 0x08), (0x00, 0x0D),          # 注册/取消通知、设置传输参数
-    (0x20, 0x03), (0x20, 0x04), (0x20, 0x06),          # LC3/LDAC/LHDC 切换：会触发重协商
-    (0x1C, 0x02),                                       # 写入提示音
-    (0x1E, 0x02),                                       # 设置增益
-    (0x26, 0x02),                                       # 设置指示灯
-    (0x28, 0x02), (0x28, 0x04), (0x28, 0x07),          # 一拖二开关/超时/操作
-    (0x2C, 0x03),                                       # 写入手势
-    (0x40, 0x04), (0x40, 0x2A),                        # 设置 ANC 模式/切换配置
-    (0x0A, 0x06),                                       # EQ 写入
+# 只重发已知的幂等查询。翻页命令可能推进设备端游标。
+RETRYABLE_READS = {
+    (0x00, 0x00), (0x00, 0x01), (0x00, 0x03), (0x00, 0x05),
+    (0x00, 0x0C), (0x00, 0x14), (0x00, 0x15),
+    (0x0A, 0x00), (0x0A, 0x01), (0x0A, 0x02), (0x0A, 0x04), (0x0A, 0x05),
+    (0x1A, 0x00), (0x1A, 0x01),
+    (0x1C, 0x01), (0x1E, 0x01),
+    (0x20, 0x01), (0x20, 0x02), (0x20, 0x05),
+    (0x26, 0x01), (0x28, 0x01), (0x28, 0x03), (0x28, 0x05),
+    (0x2C, 0x01), (0x2C, 0x02),
+    (0x40, 0x03), (0x40, 0x29),
 }
-
-
-def _retry_safe(feature, cmd):
-    """判断该命令能否安全重发（幂等读命令可以，写命令不行）。"""
-    if cmd & 0x80:
-        return False
-    return ((feature & 0xFE), (cmd & 0x7F)) not in WRITE_CMDS
-
-
-def _send_retries(feature, cmd):
-    """按命令语义决定 /api/send 的重试次数：写命令不重发，读命令重试 1 次。"""
-    return 1 if _retry_safe(feature, cmd) else 0
 
 
 def _fmt_value(value):
@@ -1206,6 +1170,7 @@ def read_state():
     # 等满各自超时，最坏约 17s，页面一直转圈。
     silent_streak = 0
     aborted_early = False
+    link_failed = False
     for key, feature, cmd, payload, timeout, retries, label in STATE_READS:
         if key in by_key:
             # 兜底探活时已经读过电量，不要重复发。
@@ -1214,6 +1179,10 @@ def read_state():
         result["label"] = label
         steps.append(result)
         by_key[key] = result
+        if result.get("status") in ("no_link", "write_failed"):
+            link_failed = True
+            aborted_early = True
+            break
         if _step_answered(result):
             silent_streak = 0
         else:
@@ -1286,14 +1255,16 @@ def read_state():
     # 不能再用 decoded 是否存在判断：无关通知帧也有 decoded，但那不证明设备
     # 响应了本次请求（评审第 6 条）。state 各项值本身由 _payload_of() 过滤
     # （error/notification/matched=False 都返回 None），所以不受此判据影响。
-    online = any(_step_answered(step) for step in steps)
+    connected = bool(ser is not None and ser.is_open)
+    online = connected and not link_failed and any(_step_answered(step) for step in steps)
     answered = any(_step_ok(step) for step in steps)
     device_online = online
     return {
         "online": online,
         "answered": answered,
-        # 因连续两项零接收而提前结束：调用方可据此提示「链路中断，状态不完整」。
         "aborted_early": aborted_early,
+        "connected": connected,
+        "probe_status": probe_status,
         "demo": isinstance(ser, MockSerial),
         "port": getattr(ser, "port", None),
         "state": state,
@@ -2245,13 +2216,18 @@ async function refreshAll(){
     const data = await apiCall('/api/state', '全量刷新');
     S.demo = !!data.demo;
     applyState(data.state || {});
-    setOnline(!!data.online, data.online ? (S.demo ? '已连接 · DEMO' : '已连接') : '设备未响应');
+    setOnline(
+      !!data.online && !data.aborted_early,
+      data.aborted_early ? '读取中断，请重新读取' : (data.online ? '' : '设备未响应')
+    );
     renderAll();
     // online 只说明设备有应答，不代表读到了数据：设备对所有读取回错误帧时
     // online=true、answered=false、state 为空，旧判据会提示「状态已刷新」却
     // 什么都没刷新（评审第 6 条，与 refreshBattery 同类）。
     const gotState = data.state && Object.keys(data.state).length > 0;
-    if(data.answered && gotState){
+    if(data.aborted_early){
+      toast('读取提前结束，设备状态可能不完整', false);
+    }else if(data.answered && gotState){
       toast('状态已刷新', true);
     }else if(data.online && !data.answered){
       toast('设备已应答，但拒绝了全部读取', false);
@@ -2690,7 +2666,7 @@ class Handler(BaseHTTPRequestHandler):
             feature = _req_int(q, "feature", 0, 0xFF)
             cmd = _req_int(q, "cmd", 0, 0xFF)
             payload = q.get("payload", [""])[0]
-            result = send_cmd(feature, cmd, payload, retries=_send_retries(feature, cmd))
+            result = send_cmd(feature, cmd, payload, retries=int((feature, cmd) in RETRYABLE_READS))
             result["label"] = "自定义命令"
             return {
                 "steps": [result],

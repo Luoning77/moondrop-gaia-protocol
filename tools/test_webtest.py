@@ -40,6 +40,7 @@
 """
 import pathlib
 import sys
+import threading
 
 import pytest
 
@@ -600,44 +601,27 @@ def test_issue5_len_513_resync():
         )
 
 
-def test_issue5_cross_frame_swallow():
-    """Len 字段「能凑够」时，不得把后续合法帧当成 payload 吞掉。
+def test_issue5_complete_frame_can_contain_frame_bytes():
+    inner = _response(0x40, 0x03, b"\x01")
+    outer = _response(0x00, 0x0C, b"\x42" + inner)
+    _install(_simple_device({(0x00, 0x0C): outer}))
 
-    构造：Len=200 的帧头 + 190 字节填充 + 合法帧 G1(9B) + 合法帧 G2(9B)。
-    Len=200 声明需要 208 字节，而缓冲区里恰好有 208 字节可用，
-    于是一个不做内容校验的实现会把 G1、甚至 G2 整个吞进 payload。
-    断言只有两种可接受结果：取不到帧（等待更多数据/判坏），
-    或者取到的帧 payload 长度 <= MAX_PAYLOAD 且不包含后续完整合法帧。
-    """
-    filler_len = 190
-    g1 = GOOD_FRAME
-    g2 = _response(0x40, 0x03, b"\x01")
-    header = bytes([0xFF, 0x04, 0x00, 0xC8, 0x00, 0x1D, 0x41, 0x03])  # Len = 200
-    buf = header + bytes(filler_len) + g1 + g2
+    result = webtest.send_cmd(0x00, 0x0C, "02", timeout=0.05, retries=0)
 
-    frame, rest = webtest._take_frame(bytearray(buf))
+    assert result["ok"]
+    assert result["rx_raw"] == outer.hex(" ").upper()
 
-    if frame is None:
-        return  # 取不到帧是可接受的（等待更多数据，或判坏帧后重同步）
 
-    payload = frame[8:]
-    assert len(payload) <= MAX_PAYLOAD, (
-        f"取到的帧 payload 长度 {len(payload)} 超过 MAX_PAYLOAD={MAX_PAYLOAD}，"
-        f"帧={frame[:16].hex(' ').upper()}…。对应评审第 5 条。"
-    )
-    # 关键断言：不能把「完整的后续合法帧」当成 payload 内容吞进去。
-    swallowed = []
-    if g1 in payload:
-        swallowed.append(f"G1={g1.hex(' ').upper()}")
-    if g2 in payload:
-        swallowed.append(f"G2={g2.hex(' ').upper()}")
-    assert not swallowed, (
-        "期望 Len=200 的帧不得把后续合法帧当成 payload 吞掉，实际 payload "
-        f"（长度 {len(payload)}）包含 {', '.join(swallowed)}。"
-        f"完整帧={frame.hex(' ').upper()}、rest={bytes(rest).hex(' ').upper()}。"
-        "当前实现只按 Len 截取、不校验帧边界，会把紧随其后的合法帧整段吃掉导致丢响应。"
-        "对应评审第 5 条。"
-    )
+@pytest.mark.parametrize("with_notification", [False, True])
+def test_issue5_recovers_complete_frame_after_incomplete_header(with_notification):
+    header = bytes.fromhex("FF 04 00 32 00 1D 01 05")
+    notification = _notification(0x40, 0x03, b"\x01") if with_notification else b""
+    _install(_simple_device({(0x40, 0x03): header + notification + GOOD_FRAME}))
+
+    result = webtest.send_cmd(0x40, 0x03, timeout=0.05, retries=0)
+
+    assert result["ok"]
+    assert result["rx_raw"] == GOOD_FRAME.hex(" ").upper()
 
 
 def test_issue2_retry_does_not_clear_valid_carry():
@@ -878,7 +862,7 @@ def test_issue6_mark_online_requires_device_answer():
     )
 
     error_frame = webtest.decode_packet(_device_error(0x40, 0x04, 5))
-    webtest._mark_online([{"decoded": error_frame}])
+    webtest._mark_online([{"decoded": error_frame, "matched": True}])
     assert webtest.device_online is True, (
         "期望收到设备错误帧时 _mark_online 判在线（设备明确拒绝了命令，说明设备在），"
         f"实际 device_online={webtest.device_online!r}。对应评审第 6 条。"
@@ -1239,3 +1223,96 @@ def test_issue6_set_unmatched_other_command_still_fails(monkeypatch):
         f"实际 ok={result['ok']!r}、message={result['message']!r}。对应 R3 放宽过度。"
     )
 
+
+
+
+def test_concurrent_requests_preserve_buffered_response(monkeypatch):
+    firmware = _response(0x00, 0x05, b"3.5.6")
+    _install(_simple_device({
+        (0x00, 0x05): _notification(0x40, 0x03, b"\x01") + firmware,
+        (0x00, 0x03): _response(0x00, 0x03, b"SERIAL"),
+    }))
+    first_received = threading.Event()
+    second_waiting = threading.Event()
+    lock = threading.Lock()
+    receive = webtest._recv_frame
+    results = {}
+
+    class ObservedLock:
+        def __enter__(self):
+            if threading.current_thread().name == "second-request":
+                second_waiting.set()
+            lock.acquire()
+
+        def __exit__(self, *exc):
+            lock.release()
+
+    def receive_after_second_starts(timeout):
+        frame = receive(timeout)
+        if frame and webtest.decode_packet(frame)["frame_type"] == "notification":
+            first_received.set()
+            assert second_waiting.wait(2)
+        return frame
+
+    def request(key, command):
+        results[key] = webtest.send_cmd(0x00, command, timeout=0.3, retries=0)
+
+    monkeypatch.setattr(webtest, "ser_lock", ObservedLock())
+    monkeypatch.setattr(webtest, "_recv_frame", receive_after_second_starts)
+    first = threading.Thread(target=request, args=("first", 0x05))
+    second = threading.Thread(target=request, args=("second", 0x03), name="second-request")
+    first.start()
+    assert first_received.wait(2)
+    second.start()
+    first.join(2)
+    second.join(2)
+
+    assert results["first"]["rx_raw"] == firmware.hex(" ").upper()
+    assert results["first"]["ok"] and results["second"]["ok"]
+
+
+def test_unmatched_probe_uses_battery_fallback(monkeypatch):
+    _fast_read_state(monkeypatch)
+    _install(FakeSerial(lambda *_: _response(0x00, 0x03, b"SERIAL")))
+
+    result = webtest.Handler._route(_FakeHandler(), "/api/check", {})
+
+    assert not result["online"]
+    assert [step["status"] for step in result["steps"]] == ["unmatched", "unmatched"]
+
+
+def test_state_read_stops_on_serial_write_failure(monkeypatch):
+    _fast_read_state(monkeypatch)
+
+    class FailingDevice(FakeSerial):
+        def write(self, data):
+            if self.writes:
+                self.writes.append(bytes(data))
+                raise OSError("serial connection failed")
+            return super().write(data)
+
+    device = _install(FailingDevice(lambda *_: _response(0x00, 0x05, b"3.5.6")))
+    result = webtest.read_state()
+
+    assert len(device.writes) == 2
+    assert not result["online"] and result["aborted_early"]
+    assert result["connected"]
+    assert result["state"]["firmware"] == "3.5.6"
+
+
+@pytest.mark.parametrize(("feature", "command", "expected_writes"), [
+    (0x0A, 0x03, 1),
+    (0x0A, 0x07, 1),
+    (0x0A, 0x08, 1),
+    (0x00, 0x02, 1),  # 翻页可能推进设备端游标
+    (0x40, 0x03, 2),  # 幂等查询仍允许重试
+])
+def test_custom_command_retries_only_known_reads(monkeypatch, feature, command, expected_writes):
+    _fast_read_state(monkeypatch)
+    device = _install(FakeSerial())
+
+    webtest.Handler._route(_FakeHandler(), "/api/send", {
+        "feature": [str(feature)], "cmd": [str(command)],
+    })
+
+    assert len(device.writes) == expected_writes
