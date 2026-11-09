@@ -940,15 +940,39 @@ def _error_of(result):
     return None
 
 
+def _only_notifications(result):
+    """本次请求只收到了无关通知帧（或什么都没收到），没有设备对本命令的裁决。
+
+    「SET 无 ACK」是既定设计：真机上 SET 不回 ACK 时靠写后重读判定。
+    但如果写窗口内恰好来了一条异步通知（例如 ANC 变更推送 `40 84`），
+    matched 会是 False、error 为 None，而 decoded 非空 —— 旧判据
+    `not result.get("decoded")` 因此为假，会把这种情况当成「有响应但没匹配上」
+    直接判失败，写后重读根本没机会生效。
+    """
+    frames = result.get("frames") or []
+    for frame in frames:
+        ftype = frame.get("frame_type") if isinstance(frame, dict) else None
+        # 只要出现过「其它命令的响应」或「错误帧」，就不是单纯的通知噪声，
+        # 必须按失败处理，不能走重读兜底。
+        if ftype in ("response", "error"):
+            return False
+    d = result.get("decoded")
+    if d and d.get("frame_type") in ("response", "error"):
+        return False
+    return True
+
+
 def _write_no_reply_ok(result):
     """SET 无 ACK 是正常现象（真机 SET 不回 ACK，靠写后重读验证）。
 
-    只在「确实没收到任何匹配帧，且失败原因就是无响应」时标记，前端日志的
-    `!step.no_reply_ok` 分支才能把真实的写失败显示成红色。
+    只在「本次请求没有得到设备的任何裁决（无帧 / 全是通知）」且失败原因就是
+    无响应时标记，前端日志的 `!step.no_reply_ok` 分支才能把真实的写失败显示成红色。
     """
-    return (result.get("matched") is False
-            and result.get("error") == "无响应"
-            and not result.get("decoded"))
+    if result.get("error") not in (None, "无响应"):
+        return False
+    if result.get("error_name"):
+        return False
+    return _only_notifications(result) and result.get("matched") is not True
 
 
 def _classify_write(set_result, after, expected, expected_label="目标"):
@@ -972,7 +996,10 @@ def _classify_write(set_result, after, expected, expected_label="目标"):
         return False, f"写入失败：{write_error}", extra
     if error_name:
         return False, f"设备拒绝：{error_name}", extra
-    if matched is False and not write_error:
+    if matched is False and not write_error and not _only_notifications(set_result):
+        # 收到了「其它命令的响应」或错误帧 → 确实是没匹配上，判失败。
+        # 但如果本次只收到无关通知（或什么都没收到），属于 SET 无 ACK，
+        # 交给下面按重读值判定。
         return False, "未收到匹配的响应帧", extra
     if has_ack:
         if after == expected:
@@ -1108,39 +1135,59 @@ STATE_READS = [
 ]
 
 
+def _probe_device():
+    """两级探活，返回 (steps, by_key, status, alive)。
+
+    第一级读固件（`00 05`），第二级读电量（`1A 01`，面板本来就要读）。
+    判据是「有没有来自设备的应答」而不是「decoded 是否存在」（评审第 6 条）：
+      - 收到匹配响应 / 设备错误帧：设备在
+      - 无响应：可能设备不在，也可能只是这条命令不被支持（真机上 00 00、00 03
+        就确实无回帧），所以补第二条再确认一次
+      - 只收到无关通知：不能据此判在线
+    `alive` 为 False 表示两条探活都没有得到应答。
+
+    /api/check 与 read_state 共用这段逻辑，避免两个接口对同一台设备给出相反结论。
+    """
+    steps = []
+    by_key = {}
+
+    probe = send_cmd(0x00, 0x05, "", timeout=1.0, retries=1)
+    probe["label"] = "读取固件版本"
+    steps.append(probe)
+    by_key["firmware"] = probe
+    status = probe.get("status")
+
+    probe2 = None
+    if not _step_answered(probe) and status not in ("no_link", "write_failed"):
+        # 兜底探活。串口没打开 / 串口写失败时不重试：再发一次只会得到同样的
+        # no_link，白等待，还会让 read_state 的 steps 多出无意义的条目。
+        probe2 = send_cmd(0x1A, 0x01, "010203", timeout=0.6, retries=0)
+        probe2["label"] = "探活（读取电量）"
+        steps.append(probe2)
+        by_key["battery"] = probe2
+        status = probe2.get("status")
+
+    alive = any(_step_answered(step) for step in steps)
+    return steps, by_key, status, alive
+
+
 def read_state():
     global device_online
     steps = []
     by_key = {}
 
-    # 探活采用两级阶梯：完全没有应答才判定离线，避免「某条命令不支持」被误判成离线。
-    #
-    # 判据是「有没有来自设备的应答」而不是「decoded 是否存在」（评审第 6 条）：
-    #   - 收到匹配响应 / 设备错误帧：设备在，继续读其余项
-    #   - 无响应：可能是设备不在，也可能只是这条命令不被支持（真机上 00 00、00 03
-    #     就确实无回帧），所以补一条面板本来就要读的命令再确认一次
-    #   - 只收到无关通知：不能据此判在线，但也不值得再等满 12 项
-    probe = send_cmd(0x00, 0x05, "", timeout=1.0, retries=1)
-    probe["label"] = "读取固件版本"
-    steps.append(probe)
-    by_key["firmware"] = probe
-    probe_status = probe.get("status")
+    probe_steps, probe_by_key, probe_status, alive = _probe_device()
+    steps.extend(probe_steps)
+    by_key.update(probe_by_key)
 
-    probe2 = None
-    if not _step_answered(probe) and probe_status in ("timeout", "unparsed"):
-        # 兜底探活：电量查询面板本来就要读，用它确认设备是否真的不在。
-        probe2 = send_cmd(0x1A, 0x01, "010203", timeout=0.6, retries=0)
-        probe2["label"] = "探活（读取电量）"
-        steps.append(probe2)
-        by_key["battery"] = probe2
-        probe_status = probe2.get("status")
-
-    if probe2 is not None and not _step_answered(probe2):
+    if not alive:
         # 两条探活都没有任何应答：判定离线，跳过其余读取，避免页面卡十几秒。
         device_online = False
         return {
             "online": False,
             "answered": False,
+            "aborted_early": False,
+            "connected": bool(ser is not None and ser.is_open),
             "probe_status": probe_status,
             "demo": isinstance(ser, MockSerial),
             "port": getattr(ser, "port", None),
@@ -1148,16 +1195,16 @@ def read_state():
             "steps": steps,
         }
 
-    # 逐项读取时加「连续无接收」守卫。
+    # 逐项读取时加「连续未应答」守卫。
     #
-    # 判据是 rx_raw is None —— 这一项连一个字节都没收到，而不是「没匹配上」。
-    # 设备回错误帧、回无关帧都算有接收，不会触发提前退出；只有链路真的没反应
-    # 才退出。没有这个守卫时，链路只推送通知或读到一半断连，会逐项等满各自
-    # 的超时（最坏约 17s），页面一直转圈。
+    # 判据是 _step_answered() 为假 —— 既覆盖「一个字节都没收到」，也覆盖
+    # 「只收到无关通知」（通知有 rx_raw，但没证明设备处理了请求）。
+    # 设备回错误帧算已应答，不会触发退出：真机上 LC3/LDAC 回的就是错误帧。
     #
-    # 注意 STATE_READS 里每一项都必须是真机上有回帧的命令：如果连续两项都不支持，
-    # 这里会误判断连。当前 12 项均已验证（LC3/LDAC 回的是错误帧，不是无回帧）。
-    empty_streak = 0
+    # 阈值取 3 而不是 2：给「某条命令确实不支持」留出余量，避免连续两条不支持
+    # 就被误判成链路断开，把后面的项漏读掉。没有这个守卫时，链路中途静默会逐项
+    # 等满各自超时，最坏约 17s，页面一直转圈。
+    silent_streak = 0
     aborted_early = False
     for key, feature, cmd, payload, timeout, retries, label in STATE_READS:
         if key in by_key:
@@ -1167,11 +1214,11 @@ def read_state():
         result["label"] = label
         steps.append(result)
         by_key[key] = result
-        if result.get("rx_raw"):
-            empty_streak = 0
+        if _step_answered(result):
+            silent_streak = 0
         else:
-            empty_streak += 1
-            if empty_streak >= 2:
+            silent_streak += 1
+            if silent_streak >= 3:
                 aborted_early = True
                 break
 
@@ -2200,7 +2247,17 @@ async function refreshAll(){
     applyState(data.state || {});
     setOnline(!!data.online, data.online ? (S.demo ? '已连接 · DEMO' : '已连接') : '设备未响应');
     renderAll();
-    if(data.online) toast('状态已刷新', true);
+    // online 只说明设备有应答，不代表读到了数据：设备对所有读取回错误帧时
+    // online=true、answered=false、state 为空，旧判据会提示「状态已刷新」却
+    // 什么都没刷新（评审第 6 条，与 refreshBattery 同类）。
+    const gotState = data.state && Object.keys(data.state).length > 0;
+    if(data.answered && gotState){
+      toast('状态已刷新', true);
+    }else if(data.online && !data.answered){
+      toast('设备已应答，但拒绝了全部读取', false);
+    }else if(data.online && !gotState){
+      toast('设备已应答，但没有读到任何状态', false);
+    }
   }catch(err){
     setOnline(false, '设备未响应');
     renderAll();
@@ -2607,23 +2664,23 @@ class Handler(BaseHTTPRequestHandler):
                 "demo": isinstance(ser, MockSerial),
             }
         if path == "/api/check":
-            result = send_cmd(0x00, 0x05, "", timeout=1.2, retries=1)
-            result["label"] = "探测设备"
-            # online 表示「设备给过应答」（含错误帧，设备在线但拒绝该命令）；
-            # answered 表示「应答符合本次请求」。两者区分开，前端才能显示
-            # 「设备拒绝」而不是误报「设备离线」（评审第 6 条）。
-            online = _step_answered(result)
+            # 与 read_state 共用同一套两级探活，否则同一台设备两个接口会给出
+            # 相反结论：设备支持电量、不支持读固件时，/api/check 报离线而
+            # /api/state 报在线。
+            check_steps, _by_key, status, online = _probe_device()
             device_online = online
             return {
                 "connected": bool(ser is not None and ser.is_open),
                 "online": online,
-                "answered": _step_ok(result),
-                "status": result.get("status"),
-                "error_name": result.get("error_name"),
+                "answered": any(_step_ok(step) for step in check_steps),
+                "status": status,
+                "error_name": next(
+                    (step.get("error_name") for step in check_steps
+                     if step.get("error_name")), None),
                 "demo": isinstance(ser, MockSerial),
                 "port": getattr(ser, "port", None),
-                "steps": [result],
-                "result": result,
+                "steps": check_steps,
+                "result": check_steps[-1],
             }
         if path == "/api/presets":
             return PRESETS

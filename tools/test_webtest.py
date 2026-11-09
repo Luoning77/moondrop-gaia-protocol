@@ -1040,3 +1040,202 @@ def test_issue6_read_state_does_not_abort_on_device_errors(monkeypatch):
         f"实际 state={result['state']!r}。"
     )
 
+
+# ---------------------------------------------------------------------------
+# 第二轮复查追加：R1 / R2 / R3 / R4
+# ---------------------------------------------------------------------------
+def test_issue6_api_check_uses_same_probe_ladder(monkeypatch):
+    """R1：/api/check 必须与 read_state 用同一套两级探活。
+
+    否则同一台设备两个接口会给出相反结论：设备支持电量、不支持读固件时，
+    /api/check 报离线而 /api/state 报在线。
+    """
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        # 00 05 无回帧，其余正常 —— 与真机 00 00/00 03 无回帧同型
+        (0x1A, 0x01): _response(0x1A, 0x01, bytes([1, 82, 2, 79, 3, 0xFF])),
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),
+    }))
+    check = webtest.Handler._route(_FakeHandler(), "/api/check", {})
+    state = webtest.read_state()
+
+    assert check["online"] is True, (
+        "期望 /api/check 在固件无回帧、电量有应答时判 online=True，"
+        f"实际 online={check['online']!r}、status={check.get('status')!r}。"
+        "它仍是单发 00 05，没有接上两级探活。对应 R1。"
+    )
+    assert check["answered"] is True, (
+        f"期望 answered=True（电量应答成功），实际 {check['answered']!r}。对应 R1。"
+    )
+    assert check["online"] == state["online"], (
+        "期望 /api/check 与 read_state 对同一台设备给出相同结论，"
+        f"实际 check.online={check['online']!r}、state.online={state['online']!r}。对应 R1。"
+    )
+
+
+def test_issue6_read_state_no_link_fails_fast(monkeypatch):
+    """R4(c)：串口未打开时不该逐项刷 no_link，也不该标成 aborted_early。"""
+    _fast_read_state(monkeypatch)
+    webtest.ser = None
+    result = webtest.read_state()
+
+    assert result["online"] is False, f"期望 online=False，实际 {result['online']!r}。"
+    assert result["connected"] is False, (
+        f"期望 connected=False，实际 {result.get('connected')!r}。对应 R4(c)。"
+    )
+    assert result["aborted_early"] is False, (
+        "期望串口未打开时 aborted_early=False（「没连上」不是「提前中断」），"
+        f"实际 {result['aborted_early']!r}。对应 R4(c)。"
+    )
+    assert len(result["steps"]) <= 2, (
+        f"期望最多 2 条探活（不重复发 no_link），实际 {len(result['steps'])} 条。对应 R4(c)。"
+    )
+
+
+def test_issue6_read_state_stops_when_only_notifications(monkeypatch):
+    """R4(a)：只收到通知、从不应答时，必须尽早收工，不能跑满 13 步。
+
+    两级探活都只拿到通知 → 判不出设备在，走「不存活」分支直接返回，
+    比逐项读到守卫阈值更早收工。
+    """
+    _fast_read_state(monkeypatch)
+
+    def respond(feature, cmd, payload):
+        return _notification(0x40, 0x03, bytes([1]))
+
+    _install(FakeSerial(respond))
+    result = webtest.read_state()
+
+    assert result["online"] is False, (
+        f"期望只收到通知时 online=False（通知不能证明设备处理了请求），"
+        f"实际 {result['online']!r}。对应 R4(a)。"
+    )
+    assert result["state"] == {}, (
+        f"期望只有通知时不填充 state，实际 {result['state']!r}。对应 R4(a)。"
+    )
+    assert len(result["steps"]) <= 5, (
+        "期望尽早收工（旧守卫用 rx_raw 判断，通知帧有 rx_raw 所以抓不到，"
+        f"会跑满 13 步），实际只跑了 {len(result['steps'])} 步。对应 R4(a)。"
+    )
+
+
+def test_issue6_read_state_guard_stops_on_silent_tail(monkeypatch):
+    """R4(a)：探活正常、但后续命令只收到通知时，守卫要按「连续未应答」收工。
+
+    这条才真正走到守卫循环：前两级探活有应答（判为在线），之后每条只拿到
+    一条通知。旧判据看 rx_raw（通知有值）不会计为未应答，会跑满 13 步。
+    """
+    _fast_read_state(monkeypatch)
+    probe_keys = {(0x00, 0x05), (0x1A, 0x01)}
+
+    def respond(feature, cmd, payload):
+        if (feature, cmd) in probe_keys:
+            if (feature, cmd) == (0x00, 0x05):
+                return _response(0x00, 0x05, b"3.5.6")
+            return _response(0x1A, 0x01, bytes([1, 82, 2, 79, 3, 0xFF]))
+        # 其余命令只回异步通知，没有任何针对本次请求的应答
+        return _notification(0x40, 0x81, bytes([1]))
+
+    _install(FakeSerial(respond))
+    result = webtest.read_state()
+
+    assert result["aborted_early"] is True, (
+        "期望探活后连续收到通知时触发守卫提前结束，"
+        f"实际 aborted_early={result['aborted_early']!r}、steps={len(result['steps'])} 条。"
+        "旧判据用 rx_raw（通知帧非空）判断，抓不到这种静默。对应 R4(a)。"
+    )
+    assert len(result["steps"]) < 13, (
+        f"期望提前结束、不跑满 13 步，实际 {len(result['steps'])} 步。对应 R4(a)。"
+    )
+    assert result["online"] is True, (
+        "期望探活阶段已证明设备在线，online=True，"
+        f"实际 {result['online']!r}。"
+    )
+
+
+def test_issue6_read_state_keeps_going_on_device_errors(monkeypatch):
+    """R4(b) 回归基准：设备回错误帧算已应答，不能误判断连。"""
+    _fast_read_state(monkeypatch)
+    rules = {
+        (0x00, 0x05): _response(0x00, 0x05, b"3.5.6"),
+        (0x1A, 0x01): _response(0x1A, 0x01, bytes([1, 82, 2, 79, 3, 0xFF])),
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),
+        (0x40, 0x29): _response(0x40, 0x29, bytes([1, 1, 1, 1, 0])),
+        (0x1E, 0x01): _response(0x1E, 0x01, bytes([1])),
+        (0x26, 0x01): _response(0x26, 0x01, bytes([1])),
+        (0x2C, 0x02): _response(0x2C, 0x02, bytes([0x11, 0x23, 0x77, 0x45, 0x66])),
+        (0x1C, 0x01): _response(0x1C, 0x01, bytes([1, 64, 1])),
+        (0x20, 0x05): _response(0x20, 0x05, bytes([0])),
+        # 连续三条错误帧：仍算已应答
+        (0x20, 0x01): _device_error(0x20, 0x01, 1),
+        (0x20, 0x02): _device_error(0x20, 0x02, 1),
+        (0x28, 0x01): _response(0x28, 0x01, bytes([1])),
+        (0x28, 0x03): _response(0x28, 0x03, bytes([5])),
+    }
+    _install(_simple_device(rules))
+    result = webtest.read_state()
+
+    assert result["aborted_early"] is False, (
+        "期望设备回错误帧时不触发提前结束，"
+        f"实际 aborted_early={result['aborted_early']!r}、steps={len(result['steps'])} 条。"
+    )
+    assert result["state"].get("onebringtwo") == 1, (
+        "期望错误帧之后的项仍然读到，"
+        f"实际 state={result['state']!r}。对应 R4(b)。"
+    )
+
+
+def test_issue6_refresh_all_requires_state_data():
+    """R2：refreshAll 不能用 data.online 判刷新成功。"""
+    html = webtest.HTML
+    assert "if(data.answered" in html, (
+        "期望 refreshAll 用 data.answered 判断刷新成功，"
+        "实际 HTML 里没有 data.answered。设备在线但拒绝全部读取时"
+        "online=true、answered=false、state 为空，旧判据仍会提示「状态已刷新」。对应 R2。"
+    )
+    assert "if(data.online) toast('状态已刷新', true);" not in html, (
+        "期望移除 `if(data.online) toast('状态已刷新', true);`（旧判据）。对应 R2。"
+    )
+
+
+def test_issue6_set_noack_with_notification_is_not_failure(monkeypatch):
+    """R3：SET 无 ACK + 写窗口内恰来一条通知，不能被误报为写入失败。
+
+    真机上 SET 不回 ACK 是正常现象，靠写后重读判定；此时若窗口内恰有异步
+    推送（如 ANC 变更 40 84），matched=False、error=None 但 decoded 非空，
+    旧判据会判「未收到匹配的响应帧」，把成功的写入报成失败。
+    """
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        # SET 只回一条通知、不回 ACK
+        (0x40, 0x04): _notification(0x40, 0x81, bytes([0x02])),
+        # 重读返回目标值 2
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),
+    }))
+    result = webtest.set_anc(2)
+
+    assert result["ok"] is True, (
+        "期望 SET 无 ACK + 窗口内有通知时仍按重读值判成功，"
+        f"实际 ok={result['ok']!r}、message={result['message']!r}。"
+        "旧判据 `matched is False and not write_error` 直接判失败。对应 R3。"
+    )
+    assert result["message"] == "写入后重读一致", (
+        f"期望 message='写入后重读一致'，实际 {result['message']!r}。对应 R3。"
+    )
+
+
+def test_issue6_set_unmatched_other_command_still_fails(monkeypatch):
+    """R3 回归基准：收到「其它命令的响应帧」仍必须判失败，不能放宽过头。"""
+    _fast_read_state(monkeypatch)
+    _install(_simple_device({
+        # SET ANC 却收到电量域的响应帧
+        (0x40, 0x04): _response(0x1A, 0x01, bytes([1, 82])),
+        (0x40, 0x03): _response(0x40, 0x03, bytes([0x02])),
+    }))
+    result = webtest.set_anc(2)
+
+    assert result["ok"] is False, (
+        "期望收到其它命令的响应帧时判失败（数据没对上，不能靠重读兜底），"
+        f"实际 ok={result['ok']!r}、message={result['message']!r}。对应 R3 放宽过度。"
+    )
+
