@@ -16,46 +16,58 @@ MOONDROP Pudding (布丁) TWS 蓝牙 SPP 控制协议库，基于 btsnoop 抓包
 ## 协议格式
 
 ```
-FF 04 [Len:2 BE] [Seq:1] [Vendor:1] [Feature:1] [Cmd:1] [Payload...]
+FF 04 [Len:2 BE] [00] [Vendor:1D] [Feature:1] [Cmd:1] [Payload...]
 ```
 
-- Len = 1 + 1 + payload.size（feature + cmd + payload）
+- Len = payload.size（与 btsnoop 抓包一致）
 - 总包长 = 8 + payload.size
 - 响应 Feature = 请求 Feature | 0x01 (bit0)
+- Feature 字节 = `feature_id << 1`，bit0 为响应位；例如 ANC V2 的 feature_id=32 → `0x40`
+- 多字节字段一律大端，Vendor 为 16 位 `0x001D`
+- 第 4 字节抓包始终为 `0x00`（早期逆向曾记为递增序列号；也可能是 Vendor `0x001D` 的高字节，待确认）
 
 ### 响应格式
 
-| 类型 | 格式 | 说明 |
-|------|------|------|
-| QUERY 响应 | `[当前值]` | 1 字节，直接是当前状态 |
-| SET 响应 | `[当前值, ?, ?]` | 3 字节，[0]=当前值，[1][2]=未知 |
+| 类型 | Feature 字节 | Cmd 字节 | 说明 |
+|------|--------------|----------|------|
+| QUERY 响应 | `feature + 1` | `cmd` | payload 为当前值 |
+| 通知 | `feature` | `cmd + 0x80` | 异步推送，如 ANC/电量变化 |
+| 错误 | `feature + 1` | `cmd + 0x80` | payload[0] 为错误码 |
 
-## Feature ID
+### Feature ID
 
 | Feature | 响应 | 用途 | 状态 |
 |---------|------|------|------|
-| 0x00 | 0x01 | 基础查询（固件版本、序列号、设备ID、配置、设备状态） | ✓ 已确认 |
+| 0x00 | 0x01 | 基础域（支持特性、序列号、版本、传输信息等） | ✓ APK 复核 |
 | 0x0A | 0x0B | EQ 参数读写（频率/gain/Q） | ✓ 实测验证 |
-| 0x1A | 0x1B | 设备管理（电量查询） | ✓ 实测验证 |
+| 0x1A | 0x1B | 电池电量 | ✓ 实测验证 |
+| 0x1C | 0x1D | 提示音（开关/音量/组号） | ✓ 协议总表确认 |
 | 0x1E | 0x1F | Gain 增益控制 | ✓ 实测验证 |
-| 0x20 | 0x21 | 编解码器（LDAC/LC3） | ✓ 已确认 |
-| 0x28 | 0x29 | 设备信息（连接设备名、设备子类型） | ✓ btsnoop 确认 |
-| 0x2C | 0x2D | 电池通知 | ✓ btsnoop 确认 |
-| 0x40 | 0x41 | ANC 降噪控制 | ✓ 实测验证 |
+| 0x20 | 0x21 | 编解码器（LC3/LDAC/LHDC） | ✓ APK 确认 |
+| 0x26 | 0x27 | 指示灯开关 | ✓ APK 确认 |
+| 0x28 | 0x29 | 一拖二（状态/超时/设备列表） | ✓ APK 确认 |
+| 0x2C | 0x2D | 手势 TOUCHV2（5 字节 × 左右耳半字节） | ✓ APK + 真机确认 |
+| 0x40 | 0x41 | ANC V2 降噪控制 | ✓ 实测验证 |
 
 ## 支持的功能
 
-### 基础查询 (Feature=0x00)
+### 基础域 (Feature=0x00)
 
 | Cmd | 功能 | 状态 |
 |-----|------|------|
-| 0x01 | 支持的命令列表 | ✓ |
-| 0x05 | 固件版本 | ✓ |
-| 0x07 | EQ 状态（兼心跳） | ✓ |
-| 0x0C | 配置查询（子命令在 payload 中） | ✓ |
-| 0x0D | 设备状态 | ✓ |
-| 0x14 | 序列号 | ✓ |
-| 0x15 | 设备 ID | ✓ |
+| 0x00 | GAIA 版本 | ✓ |
+| 0x01 | 支持的特性（首字节 more，后接 `[featureId][version]` 成对） | ✓ APK 复核 |
+| 0x02 | 支持的特性（下一页，同样为 more + 成对） | ✓ APK 复核 |
+| 0x03 | 设备序列号 | ✓ APK 复核 |
+| 0x05 | 应用/固件版本（APK 名称 APPLICATION_VERSION） | ✓ |
+| 0x07 | 注册通知（Payload=`[feature id]`） | ✓ APK 复核 |
+| 0x08 | 取消通知（Payload=`[feature id]`） | ✓ APK 复核 |
+| 0x0C | 读取传输信息（Payload=ProtocolInfo id 1..7） | ✓ APK 复核 |
+| 0x0D | 设置传输参数（**写命令**，不要放进快捷读取） | ✓ APK 复核 |
+| 0x14 | 左耳序列号（EARBUD_SN_L） | ✓ APK 复核 |
+| 0x15 | 右耳序列号（EARBUD_SN_R） | ✓ APK 复核 |
+
+> 早期文档把 `0x01` 写成“支持的命令列表”、`0x07` 写成“EQ 状态”、`0x0C` 写成“配置查询”、`0x0D` 写成“设备状态”、`0x14/0x15` 写成“序列号/设备 ID”，均已按官方 APK `V3BasicPlugin` 更正。
 
 ### ANC 降噪控制 (Feature=0x40)
 
@@ -63,55 +75,106 @@ FF 04 [Len:2 BE] [Seq:1] [Vendor:1] [Feature:1] [Cmd:1] [Payload...]
 |-----|------|------|
 | 0x03 | ANC 状态查询 | ✓ |
 | 0x04 | ANC 模式设置 | ✓ |
-| 0x29 | ANC 可用模式查询 | ✓ |
+| 0x29 | ANC 切换配置读取 | ✓ |
+| 0x2A | ANC 切换配置写入 | ✓ |
 | 0x81 | ANC 状态异步推送 | ✓ |
 | 0x84 | ANC 错误通知 | ✓ |
 
 ### Gain 增益 (Feature=0x1E)
 
-| Cmd | 功能 | 状态 |
-|-----|------|------|
-| 0x01 | Gain 查询 | ✓ |
-| 0x02 | Gain 设置 | ✓ |
+| Cmd | 功能 | 帧 |
+|-----|------|-----|
+| 0x01 | Gain 查询 | `FF 04 00 00 00 1D 1E 01` |
+| 0x02 | Gain 设置 | `FF 04 00 01 00 1D 1E 02 <level>` |
+
+### 电池电量 (Feature=0x1A)
+
+| Cmd | 功能 | 帧 |
+|-----|------|-----|
+| 0x00 | 查询支持的电池 | `FF 04 00 00 00 1D 1A 00` |
+| 0x01 | 查询指定电池 | `FF 04 00 03 00 1D 1A 01 01 02 03` |
+
+回包为 `[ID:1][level:1]` 成对出现：`1` 左耳、`2` 右耳、`3` 充电盒；`0xFF` 表示不可用。
+
+### 手势 TOUCHV2 (Feature=0x2C)
+
+| Cmd | 功能 | 帧 |
+|-----|------|-----|
+| 0x01 | 读出厂默认 | `FF 04 00 00 00 1D 2C 01` |
+| 0x02 | 读当前配置 | `FF 04 00 00 00 1D 2C 02` |
+| 0x03 | 写配置（整包 5 字节） | `FF 04 00 05 00 1D 2C 03 <b0..b4>` |
+
+5 个字节顺序固定：`单击 / 双击 / 三击 / 长按1秒 / 长按3秒`；
+每个字节高 4 位 = 左耳动作，低 4 位 = 右耳动作。
+
+| 动作 id | 动作 |
+|--------:|------|
+| 0 | 无 / 未定义 |
+| 1 | 播放 / 暂停 |
+| 2 | 上一曲 |
+| 3 | 下一曲 |
+| 4 | 音量 + |
+| 5 | 音量 − |
+| 6 | 语音助手 |
+| 7 | 降噪切换 |
+| 8–15 | 无对应文案，固件视为未定义（面板只保留设备原值，不提供新设） |
+
+> 写必须一次 5 字节全量；只写一部分会把其余手势覆盖成「无」。
+
+### 指示灯 (Feature=0x26)
+
+| Cmd | 功能 | 帧 |
+|-----|------|-----|
+| 0x01 | 读状态 | `FF 04 00 00 00 1D 26 01` |
+| 0x02 | 开/关 | `FF 04 00 01 00 1D 26 02 <0/1>` |
+
+### 提示音 (Feature=0x1C)
+
+| Cmd | 功能 | 帧 |
+|-----|------|-----|
+| 0x01 | 读配置 | `FF 04 00 00 00 1D 1C 01` |
+| 0x02 | 写配置（3 字节） | `FF 04 00 03 00 1D 1C 02 <enabled><volume><index>` |
+
+`enabled` 0/1、`volume` 0–100、`index` 提示音组号（0–255，官方调试页原文「原始组号，范围 0-255」）。
 
 ### 编解码器 (Feature=0x20)
 
-| Cmd | 功能 | 状态 |
+| Cmd | 功能 | 帧 |
+|-----|------|-----|
+| 0x01 | LC3 读 | `FF 04 00 00 00 1D 20 01` |
+| 0x02 | LDAC 读 | `FF 04 00 00 00 1D 20 02` |
+| 0x03 | LC3 写 | `FF 04 00 01 00 1D 20 03 <0/1>` |
+| 0x04 | LDAC 写 | `FF 04 00 01 00 1D 20 04 <0/1>` |
+| 0x05 | LHDC 读 | `FF 04 00 00 00 1D 20 05` |
+| 0x06 | LHDC 写 | `FF 04 00 01 00 1D 20 06 <0/1>` |
+
+### 一拖二 (Feature=0x28)
+
+| Cmd | 功能 | 帧 |
+|-----|------|-----|
+| 0x01 | 读状态 | `FF 04 00 00 00 1D 28 01` |
+| 0x02 | 开/关 | `FF 04 00 01 00 1D 28 02 <0/1>` |
+| 0x03 | 读超时 | `FF 04 00 00 00 1D 28 03` |
+| 0x04 | 写超时 | `FF 04 00 01 00 1D 28 04 <秒>` |
+| 0x05 | 设备列表 | `FF 04 00 00 00 1D 28 05` |
+| 0x06 | 列表翻页 | `FF 04 00 00 00 1D 28 06` |
+| 0x07 | 断开某台 | `... 28 07 <num><addr:6><name:utf8>` |
+
+### EQ (Feature=0x0A)
+
+| Cmd | 功能（APK V3MusicProcessingPlugin） | 状态 |
 |-----|------|------|
-| 0x01 | LC3 状态 | ✓ |
-| 0x05 | LDAC 状态 | ✓ |
-| 0x06 | 编解码器设置 | ✓ |
+| 0x00 | EQ 状态 | ✓ APK 复核 |
+| 0x01 | 可用预设 | ✓ APK 复核 |
+| 0x02 | 读取 EQ Set | ✓ APK 复核 |
+| 0x03 | 写入 EQ Set | ✓ APK 复核 |
+| 0x04 | 用户频段数 | ✓ APK 复核 |
+| 0x05 | 读取用户配置 | ✓ APK 复核 |
+| 0x06 | 写入用户配置 | ✓ APK 复核 |
+| 0x07 | 保存用户设置 | ✓ APK 复核 |
+| 0x08 | 写 NV ID | ✓ APK 复核 |
 
-### 设备管理 (Feature=0x1A)
-
-| Cmd | 功能 | 状态 |
-|-----|------|------|
-| 0x00 | 设备管理查询（电量） | ✓ |
-| 0x01 | 设备管理设置 | ✓ |
-
-### 设备信息 (Feature=0x28)
-
-| Cmd | 功能 | 状态 |
-|-----|------|------|
-| 0x01 | 设备信息 | ✓ |
-| 0x03 | 设备子类型 | ✓ |
-| 0x05 | 连接设备名 | ✓ |
-
-### EQ 参数 (Feature=0x0A)
-
-| Cmd | 功能 | 状态 |
-|-----|------|------|
-| 0x03 | EQ 带宽 | ✓ |
-| 0x05 | EQ 参数查询 | ✓ |
-| 0x06 | EQ 参数设置 | ✓ |
-
-### 电池通知 (Feature=0x2C)
-
-| Cmd | 功能 | 状态 |
-|-----|------|------|
-| 0x01 | 电池查询 1 | ✓ |
-| 0x02 | 电池查询 2 | ✓ |
-| 0x03 | 电池异步通知 | ✓ |
+> 早期文档把 `0x03` 写成“EQ 带宽”、`0x05/0x06` 写成“参数查询/设置”，已按 APK 更正；payload 编码仍需真机复核。
 
 ## ANC 模式
 
@@ -161,15 +224,15 @@ val bytes = GaiaCodec.encode(query)
 val set = GaiaPacketBuilder.ancSet(AncMode.ADAPTIVE)
 val bytes2 = GaiaCodec.encode(set)
 
-// 查询 ANC 可用模式
-val avail = GaiaPacketBuilder.ancAvailable()
+// 查询 ANC 切换配置
+val avail = GaiaPacketBuilder.ancConfigQuery()
 val bytes3 = GaiaCodec.encode(avail)
 
 // Gain 设置为低
 val gainSet = GaiaPacketBuilder.gainSet(GainLevel.LOW)
 val bytes4 = GaiaCodec.encode(gainSet)
 
-// 固件版本查询
+// 应用/固件版本查询
 val fwQuery = GaiaPacketBuilder.firmwareVersionQuery()
 val bytes5 = GaiaCodec.encode(fwQuery)
 
@@ -192,28 +255,58 @@ val packets = decoder.feed(serialData)
 
 ## Web 控制界面
 
+![--demo 模式下的调节面板](docs/webtest-demo.png)
+
+依赖：Python 3.8+、`pyserial`（`pip install pyserial`）。服务默认只监听 `127.0.0.1`。
+
 ```bash
-# 自动查找 MOONDROP 蓝牙串口
+# 假设备 DEMO（推荐先跑这个，不需要蓝牙）
+python tools/webtest.py --demo
+python tools/webtest.py --demo --web-port 9090
+python tools/webtest.py --demo --demo-noack      # 模拟真机 SET 不回 ACK
+python tools/webtest.py --demo --demo-latency 0.3  # 模拟设备延迟
+
+# 真机：自动查找 MOONDROP 蓝牙串口
 python tools/webtest.py
 
-# 指定串口
-python tools/webtest.py --port COM3
-
-# 指定 Web 端口
-python tools/webtest.py --web-port 9090
-
-# 同时指定
+# 真机：指定串口 / Web 端口
 python tools/webtest.py --port COM3 --web-port 9090
 ```
 
 功能：
-- **自动串口检测** — 通过 VID=0x05D6 自动查找 MOONDROP 设备
-- ANC 降噪控制（关闭/通透/降噪/自适应/抗风噪）
-- Gain 增益控制（高/中/低）
-- 快捷命令（固件版本/序列号/设备ID/EQ/设备状态/LDAC/LC3/连接设备名）
-- 自定义 Feature/Cmd 命令发送
-- 电量显示（左耳/右耳/充电盒）
-- 实时通信日志（TX=琥珀色, RX=绿色, ERR=红色）
+
+- **降噪五档** — 关闭 / 自适应 / 通透 / 抗风噪 / 降噪，SET `40 04` 后自动重读 `40 03` 校验
+- **手势 5 行 × 左右耳** — 单击 / 双击 / 三击 / 长按 1 秒 / 长按 3 秒，左右耳分别下拉选择；
+  写入前弹确认框展示「当前 → 修改后」5 字节十六进制，后端再次读取当前值并做整包 5 字节写入
+- **电量** — 左耳 / 右耳 / 充电盒三路进度条，`0xFF` 显示不可用，支持手动和定时刷新
+- **增益** — 高 / 中 / 低（协议值 `0x00` / `0x01` / `0x02`，与 UI 标签一一对应）
+- **指示灯** — 开关，写后重读
+- **提示音** — 开关 + 音量 + 提示音组号（0–255），3 字节整包写入；只改音量时保留读回的组号
+- **LHDC / 一拖二** — LHDC 与一拖二互斥提示；LC3/LDAC 只读展示
+- **快捷读取 / 自定义命令** — 预设读取与任意 Feature/Cmd/Payload 发送
+- **通信日志** — 每条都显示 TX/RX 原始十六进制、Feature/Cmd 和解析结果；
+  SET 无 ACK 时明确标注「无 ACK（正常，随后重读校验）」
+- **DEMO 假设备** — `tools/webtest.py` 内置 `MockSerial`，完整模拟 ANC、手势、电量、增益、
+  LED、提示音、编解码、一拖二，支持无 ACK 与延迟两种测试模式
+
+API（本地）概览：
+
+| 路径 | 说明 |
+|------|------|
+| `GET /api/state` | 一次读取固件/电量/ANC/手势/增益/LED/提示音/LHDC/一拖二 |
+| `GET /api/set/anc?mode=0..4` | 设置降噪，写后重读 |
+| `GET /api/set/gain?level=0..2` | 设置增益，写后重读 |
+| `GET /api/set/led?on=0/1` | 设置指示灯，写后重读 |
+| `GET /api/set/touch?hex=<10位十六进制>` | 整包写 5 字节手势，写后重读 |
+| `GET /api/set/tone?enabled=&volume=&index=` | 写提示音 3 字节（`index` = 提示音组号 0–255），写后重读 |
+| `GET /api/set/lhdc?on=0/1` | LHDC 开关，写后重读 |
+| `GET /api/set/multipoint?on=0/1` | 一拖二开关，写后重读 |
+| `GET /api/send?feature=&cmd=&payload=` | 自定义命令 |
+| `GET /api/presets` | 快捷读取预设 |
+
+> 写接口（`/api/set/*`、`/api/send`）会拒绝浏览器发起的跨源请求（返回 403）；curl 等不带 `Origin`/`Referer` 的本地调用不受影响。
+>
+> `/api/send` 的 `feature`/`cmd` 按 Python 整数字面量解析：`40` 表示十进制 40（`0x28`），`0x40` 才是 ANC 的 `0x40`；页面会自动把输入的十六进制转成十进制。
 
 ## 辅助工具
 
@@ -224,8 +317,11 @@ powershell tools/check_bt.ps1
 # 重置 RFCOMM 设备 (PowerShell)
 powershell tools/fix_rfc.ps1
 
-# 一键启动 Web 控制界面
-Testing.bat
+# 一键启动：DEMO 模式
+run-demo.bat
+
+# 一键启动：真机，自动检测蓝牙串口（也可手动指定，如 run-pudding.bat COM8）
+run-pudding.bat
 ```
 
 ## 构建与测试
@@ -234,7 +330,10 @@ Testing.bat
 # Kotlin 库 (Gradle, JVM 17)
 ./gradlew build          # 编译 + 运行单元测试
 
-# Web 控制界面
+# Web 控制界面（DEMO）
+python tools/webtest.py --demo
+
+# Web 控制界面（真机）
 python tools/webtest.py  # 自动检测串口，启动 Web UI
 ```
 

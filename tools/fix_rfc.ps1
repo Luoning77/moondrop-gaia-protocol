@@ -1,15 +1,39 @@
-# 尝试重置 RFCOMM 设备
-$rfcomm = Get-PnpDevice | Where-Object { $_.InstanceId -match 'MS_RFCOMM' }
-if ($rfcomm) {
-    Write-Host "找到 RFCOMM: $($rfcomm.Status) - $($rfcomm.FriendlyName)"
-    Write-Host "尝试禁用..."
-    Disable-PnpDevice -InstanceId $rfcomm.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    Write-Host "尝试启用..."
-    Enable-PnpDevice -InstanceId $rfcomm.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-    $rfcomm2 = Get-PnpDevice | Where-Object { $_.InstanceId -match 'MS_RFCOMM' }
-    Write-Host "结果: $($rfcomm2.Status)"
+#Requires -RunAsAdministrator
+# Reset the Microsoft RFCOMM device used by the Pudding SPP link.
+
+$devices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'MS_RFCOMM' })
+if (-not $devices) {
+    Write-Host "No RFCOMM device found."
+    exit 0
+}
+if ($devices.Count -gt 1) {
+    Write-Host "Found $($devices.Count) RFCOMM devices; using the first one."
+}
+$target = $devices[0]
+Write-Host "Target: $($target.Status) - $($target.FriendlyName) [$($target.InstanceId)]"
+
+Write-Host "Disabling..."
+try {
+    Disable-PnpDevice -InstanceId $target.InstanceId -Confirm:$false -ErrorAction Stop
+} catch {
+    Write-Host "Disable failed: $($_.Exception.Message)"
+    exit 1
+}
+
+Start-Sleep -Seconds 2
+
+Write-Host "Enabling..."
+try {
+    Enable-PnpDevice -InstanceId $target.InstanceId -Confirm:$false -ErrorAction Stop
+} catch {
+    Write-Host "Enable failed: $($_.Exception.Message)"
+    exit 1
+}
+
+Start-Sleep -Seconds 3
+$after = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'MS_RFCOMM' })
+if ($after) {
+    Write-Host "Result: $($after[0].Status)"
 } else {
-    Write-Host "未找到 RFCOMM 设备"
+    Write-Host "Result: device not found after reset."
 }

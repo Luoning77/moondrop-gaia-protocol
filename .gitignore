@@ -48,6 +48,8 @@ tools/frida_*.js
 tools/probe*.py
 tools/quick_*.py
 tools/test_*.py
+# 例外：tools/test_webtest.py 是 webtest.py 的回归测试，属于仓库的一部分，需入库
+!tools/test_webtest.py
 tools/run_*.py
 tools/find_*.py
 tools/list_*.py
@@ -73,3 +75,8 @@ docs/btsnoop_hci_*.log
 
 # 临时文档
 promat.md
+
+# 本地截图与 Playwright 缓存（docs/ 下的文档截图不受影响）
+.playwright-cli/
+/*.png
+/*.zip
