@@ -62,14 +62,14 @@
 | 项目 | 内容 |
 |---|---|
 | 命令 | `python -m pytest tools\test_webtest.py -q`（仓库根目录） |
-| 结果 | **30 passed**，耗时 9.96 s（第一轮修复后为 20 个用例、约 3.1 s；第二轮补齐读取路径判据后增至 30 个） |
+| 结果 | **32 passed**，耗时 6.08 s（第一轮修复后为 20 个用例、约 3.1 s；第二轮补齐读取路径判据后增至 30 个，加入链路静默守卫后 32 个） |
 | 修复前基线 | **16 failed / 4 passed**（同一测试文件在评审基线 `0a3c868` 的 `webtest.py` 上运行，约 4～5 s） |
 | 编译检查 | `python -m py_compile tools\webtest.py` → exit 0 |
 | Python | 3.14.2 |
 | pytest | 9.1.1 |
 | pyserial | 3.5 |
 | 平台 | Windows 10 专业版（10.0.19045） |
-| 测试文件 | `tools/test_webtest.py`，870 行，30 个用例 |
+| 测试文件 | `tools/test_webtest.py`，1042 行，32 个用例 |
 
 测试不依赖真实蓝牙：用实现了 pyserial 子集的 `FakeSerial`（`in_waiting` / `read` / `write` / `flush` / `reset_input_buffer` / `is_open` / `port`）注入应答，因此重试次数、坏帧重同步等断言都来自「实际 write 次数」和「注入字节序列」，不靠 sleep 计时。所有重试相关用例的 `timeout` 取 0.12～0.2 s，全套 20 个用例约 3.1 s 完成。
 
@@ -77,8 +77,8 @@
 
 ```
 $ python -m pytest tools\test_webtest.py -q
-..............................                                           [100%]
-30 passed in 9.96s
+................................                                         [100%]
+32 passed in 6.08s
 ```
 
 ```
@@ -113,6 +113,8 @@ tools/test_webtest.py::test_issue6_firmware_requires_matched PASSED
 tools/test_webtest.py::test_issue6_probe_ladder_falls_back_to_battery PASSED
 tools/test_webtest.py::test_issue6_firmware_matched_response_still_works PASSED
 tools/test_webtest.py::test_issue6_api_status_online_requires_connected PASSED
+tools/test_webtest.py::test_issue6_read_state_aborts_on_dead_link PASSED
+tools/test_webtest.py::test_issue6_read_state_does_not_abort_on_device_errors PASSED
 ```
 
 用例与评审编号的对应：
@@ -124,7 +126,7 @@ tools/test_webtest.py::test_issue6_api_status_online_requires_connected PASSED
 | 3 | `test_issue3_set_rejected_but_state_already_expected`、`test_issue3_touch_rejected_but_state_already_expected`、`test_issue3_tone_rejected_but_state_already_expected`、`test_issue3_set_noack_still_ok` |
 | 4 | `test_issue4_python_summary_unknown_codec`（Python 侧镜像防护，Kotlin 侧见 2.2） |
 | 5 | `test_issue5_bad_len_resync`、`test_issue5_bad_len_resync_recv_frame`、`test_issue5_split_and_coalesced`、`test_decode_packet_oversized_len`、`test_decode_packet_accepts_max_len`、`test_issue5_bad_vendor_resync`、`test_issue5_len_513_resync`、`test_issue5_cross_frame_swallow`、`test_issue5_mockserial_bad_len` |
-| 6 | 其余 10 条 `test_issue6_*`，逐条对应关系见 6.1 节 |
+| 6 | 12 条 `test_issue6_*`，逐条对应关系见 6.1 与 6.2 节 |
 
 **红阶段（修复前）基线**：把测试文件放到评审当时的提交 `0a3c868` 的 `tools/webtest.py` 上运行（仓库外临时目录，不改仓库文件），得到 `16 failed, 4 passed in 4.87s`。4 个通过项均为有意设置的「回归基准」，不是问题复现不出来：`test_issue2_matched_error_frame_counts_as_matched`、`test_issue3_set_noack_still_ok`、`test_issue5_split_and_coalesced`、`test_decode_packet_accepts_max_len`。代表性失败输出：
 
@@ -441,14 +443,36 @@ systemProp.https.proxyPort=7890
 
 真机验证（Pudding，固件 3.5.6，COM8）：`read_state` 返回 11 项、`firmware=3.5.6`、`online=True`、`answered=True`；`/api/status` 与 `/api/check` 的 `connected`/`online`/`answered` 均正确；设备拒绝命令时 `answered=False` 但 `online` 保持为真；单独发 `00 05` 仍 `ok=True`（加固未影响正常路径）；手势读取 `ok=True` 且 payload 5 字节。DEMO 三种模式（`--demo`、`--demo-noack`、`--demo-latency 0.1`）回归正常。
 
-`python -m pytest tools\test_webtest.py -q` → **30 passed in 9.96s**。
+`python -m pytest tools\test_webtest.py -q` → **32 passed in 6.08s**。
 
-### 6.2 本轮未处理、已知但影响有限的项
+### 6.2 链路静默时提前结束读取（`9ac8484` 之后）
 
-| 项 | 现状 | 影响 | 建议 |
-|---|---|---|---|
-| `read_state()` 只收到通知帧时会跑满 12 项 | 每项等各自的 timeout，最坏约 17s | 面板在这种异常链路上会卡一阵，但不产生错误数据 | 可加守卫：连续 2 步无 RX 早退，或 `未 answered && elapsed > 4s` 早退 |
-| `probe_status` 里的 `unparsed` 分支 | `_take_frame` 已校验 vendor/len，裸 PDU 也保证 ≥4 字节可解，实际不可达 | 无 | 保留作为防御，不必为它写测试；但不要因此回退到用 `decoded` 判据 |
+`read_state()` 顺序读 13 条命令，每条各有超时。若链路在中途静默（只推送通知、或探活后设备断连），剩余每条都会等满自己的超时，最坏约 17s 才返回，期间页面一直转圈。
+
+修复：**连续 2 条命令零接收即结束读取**，结果带 `aborted_early` 标记，已读到的值保留。
+
+判据是 `rx_raw` 为空（一个字节都没收到），而不是「没有匹配的响应」。所以：
+
+- 设备回错误帧 → 算有接收，继续读（真机上 LC3/LDAC 就是回错误帧）
+- 设备回无关帧 → 算有接收，继续读
+- 只有真正静默才触发
+
+覆盖测试：
+
+| 用例 | 断言 |
+|---|---|
+| `test_issue6_read_state_aborts_on_dead_link` | 前两项正常、之后静默 → `aborted_early=True`、steps ≤ 5、已读值保留 |
+| `test_issue6_read_state_does_not_abort_on_device_errors` | LC3/LDAC 连续两条错误帧 → `aborted_early=False`、13 步读完、错误帧之后的项仍读到 |
+
+红绿验证：去掉守卫后 `test_issue6_read_state_aborts_on_dead_link` 失败（`aborted_early=False`、跑满 13 步）。
+
+**该改动的真机验证未完成**：验证时 COM8 已无法打开（设备断开），因此「正常链路下守卫不误触发」这一条只有单元测试证据，没有真机证据。预期行为是完整读取仍返回 13 步、`aborted_early=False`；若有疑虑可在设备可用时用 `read_state()` 直接确认。
+
+### 6.3 已知但影响有限、未处理的项
+
+| 项 | 现状 | 影响 |
+|---|---|---|
+| `probe_status` 里的 `unparsed` 分支 | `_take_frame` 已校验 vendor/len，裸 PDU 也保证 ≥4 字节可解，实际不可达 | 无。保留作为防御，不必为它写测试；但不要因此回退到用 `decoded` 判据 |
 
 ---
 
