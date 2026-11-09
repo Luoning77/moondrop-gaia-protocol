@@ -79,3 +79,4 @@ promat.md
 # 本地截图与 Playwright 缓存（docs/ 下的文档截图不受影响）
 .playwright-cli/
 /*.png
+/*.zip
